@@ -2,6 +2,8 @@
 
 A minimalist chat panel for TutorBot. Click the TutorBot icon (graduation cap) in the activity bar, or press ⌘Esc.
 
+![TutorBot in 15 seconds: connect a key, pick a subject, a lesson with typeset math, a graded quiz, a coding exercise tested as you type, and the progress dashboard](images/demo.gif)
+
 Everything TutorBot needs ships with the extension: its AI engine ([pi](https://github.com/earendil-works/pi-mono)) runs on VS Code's built-in Node.js, so there's nothing else to install. Your notes, progress and exercises live in `~/TutorBot` (change it with `tutorbot.home`).
 
 Optional tools TutorBot uses when they're installed: `java` and `python3` for Java/Python exercises, and `pdftotext` (from poppler) to read PDF class materials.
@@ -28,12 +30,16 @@ A key already set in your shell environment (e.g. `ANTHROPIC_API_KEY`) also work
 
 Settings: `tutorbot.model` (empty = automatic, or `provider/model`, e.g. `anthropic/claude-sonnet-5-5`), `tutorbot.home`. For development, `tutorbot.tutorPath` loads TutorBot's extensions and skills from a working copy instead of the bundled one.
 
+## Demo video
+
+`images/demo.mp4` and `images/demo.gif` are recorded from `demo/stage.html`, which runs the real chat panel and dashboard with a scripted session. To re-record after UI changes: `node demo/gen-dashboard.cjs && node demo/record.mjs` (needs Google Chrome and ffmpeg).
+
 ## Building
 
 ```bash
 cd vscode-extension
 npm install                      # pinned pi + ts-fsrs, used only at build time
-npx @vscode/vsce package         # runs scripts/build-runtime.mjs, then packages
+npm run package                  # runs scripts/build-runtime.mjs, then packages
 ```
 
 `scripts/build-runtime.mjs` assembles `runtime/`: pi with only its runtime dependencies, plus TutorBot's extensions (`../extensions`) and the teach skill (`../skills/teach`).

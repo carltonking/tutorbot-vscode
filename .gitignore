@@ -11,3 +11,4 @@ __pycache__/
 backups/
 *.vsix
 vscode-extension/runtime/
+vscode-extension/demo/build/

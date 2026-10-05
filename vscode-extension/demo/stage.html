@@ -1,0 +1,354 @@
+<!doctype html>
+<!-- TutorBot demo stage: a VS Code-like window around the REAL TutorBot chat
+     panel and progress dashboard (chat.html / dashboard.html load the
+     extension's own media/). The timeline below plays the extension host:
+     it feeds the panel the same messages pi and the bridge would send, and
+     clicks the panel's real buttons. Recorded by record.mjs. -->
+<html lang="en"><head><meta charset="utf-8"><link rel="icon" href="data:,">
+<link rel="stylesheet" href="theme.css">
+<link rel="stylesheet" href="../media/vendor/katex.min.css">
+<title>TutorBot demo</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; width: 1280px; height: 800px; overflow: hidden; background: #0e0e0e; }
+  body { font-family: var(--vscode-font-family); font-size: 13px; color: #cccccc; }
+  .win { position: absolute; inset: 0; display: flex; flex-direction: column; background: #1f1f1f; }
+  .title { height: 32px; flex: none; background: #181818; border-bottom: 1px solid #2b2b2b; display: flex; align-items: center; justify-content: center; position: relative; color: #9d9d9d; font-size: 12.5px; }
+  .lights { position: absolute; left: 12px; display: flex; gap: 8px; }
+  .lights i { width: 12px; height: 12px; border-radius: 50%; display: block; }
+  .main { flex: 1; display: flex; min-height: 0; }
+  .activity { width: 48px; flex: none; background: #181818; border-right: 1px solid #2b2b2b; display: flex; flex-direction: column; align-items: center; padding-top: 6px; gap: 4px; }
+  .activity .ic { width: 48px; height: 44px; display: grid; place-items: center; color: #868686; position: relative; }
+  .activity .ic svg { width: 24px; height: 24px; }
+  .activity .ic.on { color: #e0e0e0; }
+  .activity .ic.on::before { content: ""; position: absolute; left: 0; top: 8px; bottom: 8px; width: 2px; background: #e0e0e0; }
+  .editor { flex: 1; min-width: 0; display: flex; flex-direction: column; background: #1f1f1f; }
+  .tabs { height: 35px; flex: none; background: #181818; display: flex; border-bottom: 1px solid #2b2b2b; }
+  .tab { display: flex; align-items: center; gap: 6px; padding: 0 14px; color: #9d9d9d; border-right: 1px solid #2b2b2b; font-size: 12.5px; }
+  .tab.on { background: #1f1f1f; color: #ffffff; box-shadow: inset 0 1px 0 #0078d4; }
+  .tab .dot { width: 8px; height: 8px; border-radius: 50%; background: #cccccc; }
+  .pane { flex: 1; min-height: 0; position: relative; }
+  .pane > * { position: absolute; inset: 0; }
+  .pane iframe { border: 0; width: 100%; height: 100%; }
+  .code { font-family: var(--vscode-editor-font-family); font-size: 14px; line-height: 22px; padding: 14px 0; overflow: hidden; }
+  .code .ln { display: flex; white-space: pre; }
+  .code .no { width: 52px; text-align: right; padding-right: 22px; color: #6e7681; flex: none; }
+  .code .ln.cur { background: #ffffff0a; }
+  .code .ln.cur .no { color: #cccccc; }
+  .code .caret { display: inline-block; width: 2px; height: 18px; background: #aeafad; vertical-align: -4px; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .code .squig { text-decoration: underline wavy #f14c4c; text-decoration-skip-ink: none; text-underline-offset: 4px; }
+  .hljs-keyword { color: #569cd6; } .hljs-title, .hljs-title.function_ { color: #dcdcaa; } .hljs-params { color: #9cdcfe; }
+  .hljs-number { color: #b5cea8; } .hljs-string { color: #ce9178; } .hljs-comment { color: #6a9955; } .hljs-built_in { color: #4ec9b0; }
+  .notes { padding: 26px 40px; font-size: 14px; line-height: 1.7; color: #cccccc; }
+  .notes h1 { font-size: 20px; color: #e8e8e8; margin: 0 0 8px; } .notes .muted { color: #8b8b8b; }
+  .side { width: 470px; flex: none; display: flex; flex-direction: column; border-left: 1px solid #2b2b2b; background: #181818; }
+  .side-head { height: 35px; flex: none; display: flex; align-items: center; padding: 0 14px; font-size: 11px; letter-spacing: .06em; color: #bbbbbb; }
+  .side iframe { flex: 1; border: 0; width: 100%; }
+  .status { height: 24px; flex: none; background: #181818; border-top: 1px solid #2b2b2b; display: flex; align-items: center; gap: 18px; padding: 0 12px; font-size: 12px; color: #9d9d9d; }
+  .status .tb { color: #cccccc; display: flex; align-items: center; gap: 6px; transition: color .2s; }
+  .status .tb.pass { color: #73c991; }
+  .status .tb.fail { color: #e2c08d; }
+  /* VS Code quick input */
+  .quick { position: absolute; top: 42px; left: 50%; width: 560px; margin-left: -280px; background: #222222; border: 1px solid #454545; border-radius: 8px; box-shadow: 0 8px 28px #000000aa; padding: 6px; display: none; z-index: 20; }
+  .quick .q-title { font-size: 12px; color: #9d9d9d; text-align: center; padding: 2px 0 6px; }
+  .quick .q-in { background: #313131; border: 1px solid #0078d4; border-radius: 4px; height: 28px; padding: 0 8px; display: flex; align-items: center; font-size: 13px; color: #cccccc; letter-spacing: .12em; }
+  .quick .q-in.ph { color: #8b8b8b; letter-spacing: 0; }
+  .quick ul { list-style: none; margin: 6px 0 0; padding: 0; }
+  .quick li { display: flex; justify-content: space-between; padding: 4px 10px; border-radius: 4px; font-size: 13px; }
+  .quick li span { color: #8b8b8b; font-size: 12px; }
+  .quick li.sel { background: #04395e; color: #ffffff; }
+  /* notification toast */
+  .toast { position: absolute; right: 488px; bottom: 36px; width: 380px; background: #252526; border: 1px solid #454545; border-radius: 6px; box-shadow: 0 6px 20px #000000aa; padding: 12px 14px; font-size: 13px; display: none; z-index: 20; gap: 10px; }
+  .toast b { color: #3794ff; font-weight: normal; }
+  /* captions */
+  .caption { position: absolute; left: 48px; right: 470px; bottom: 54px; display: flex; justify-content: center; pointer-events: none; z-index: 30; }
+  .caption div { background: #000000d9; color: #ffffff; font-size: 23px; font-weight: 600; letter-spacing: -.01em; padding: 11px 22px; border-radius: 10px; opacity: 0; transform: translateY(8px); transition: opacity .25s, transform .25s; box-shadow: 0 6px 24px #00000080; }
+  .caption div.on { opacity: 1; transform: none; }
+  .caption small { display: block; font-size: 13px; font-weight: 500; color: #bdbdbd; margin-top: 2px; text-align: center; }
+  /* cursor */
+  .cursor { position: absolute; left: 0; top: 0; width: 22px; height: 22px; z-index: 50; pointer-events: none; transition: transform .45s cubic-bezier(.3, .7, .3, 1); filter: drop-shadow(0 1px 2px #000000cc); }
+  .ripple { position: absolute; width: 28px; height: 28px; margin: -14px 0 0 -14px; border-radius: 50%; border: 2px solid #ffffffcc; z-index: 49; pointer-events: none; animation: ripple .45s ease-out forwards; }
+  @keyframes ripple { from { transform: scale(.3); opacity: 1; } to { transform: scale(1.4); opacity: 0; } }
+  /* end card */
+  .end { position: absolute; inset: 0; background: #111111f2; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; opacity: 0; transition: opacity .35s; z-index: 60; pointer-events: none; }
+  .end.on { opacity: 1; }
+  .end svg { width: 76px; height: 76px; color: #ffffff; }
+  .end h1 { margin: 0; font-size: 46px; color: #ffffff; letter-spacing: -.02em; }
+  .end p { margin: 0; font-size: 20px; color: #bdbdbd; }
+  .end .pills { display: flex; gap: 10px; margin-top: 14px; }
+  .end .pills span { border: 1px solid #4a4a4a; border-radius: 999px; padding: 5px 14px; font-size: 14px; color: #d6d6d6; }
+</style>
+</head>
+<body>
+<div class="win">
+  <div class="title"><div class="lights"><i style="background:#ff5f57"></i><i style="background:#febc2e"></i><i style="background:#28c840"></i></div>MATH 151 — Visual Studio Code</div>
+  <div class="main">
+    <div class="activity">
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/></svg></div>
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 5 5"/></svg></div>
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="6" cy="6" r="2.2"/><circle cx="6" cy="18" r="2.2"/><circle cx="18" cy="9" r="2.2"/><path d="M6 8.2v7.6M18 11.2c0 3-6 2.5-10.5 5.3"/></svg></div>
+      <div class="ic"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="4" y="4" width="7" height="7" rx="1"/><rect x="13" y="4" width="7" height="7" rx="1"/><rect x="4" y="13" width="7" height="7" rx="1"/><rect x="13" y="13" width="7" height="7" rx="1"/></svg></div>
+      <div class="ic on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.5 12 5l10 4.5-10 4.5z"/><path d="M6 11.3V16c0 1.4 2.7 3 6 3s6-1.6 6-3v-4.7"/><path d="M22 9.5v5"/></svg></div>
+    </div>
+    <div class="editor">
+      <div class="tabs" id="tabs"></div>
+      <div class="pane">
+        <div id="notes" class="notes"><h1>Week 5 · The chain rule</h1><div class="muted">MATH 151 · Lecture 9 notes</div><br>Composite functions $f(g(x))$ appear everywhere: $\sin(3x)$, $e^{x^2}$, $\sqrt{1+x^2}$.<br>Today: how to differentiate them without expanding.<br><br><span class="muted">Homework 5 due Friday · Midterm 1 on Oct 16</span></div>
+        <div id="code" class="code" hidden></div>
+        <iframe id="dash" src="dashboard.html" hidden></iframe>
+      </div>
+    </div>
+    <div class="side"><div class="side-head">TUTORBOT</div><iframe id="chat" src="chat.html"></iframe></div>
+  </div>
+  <div class="status"><span>⎇ main</span><span>⊗ 0 ⚠ 0</span><div style="flex:1"></div><span class="tb" id="sb"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M2 9.5 12 5l10 4.5-10 4.5z"/><path d="M6 11.3V16c0 1.4 2.7 3 6 3s6-1.6 6-3v-4.7"/></svg><span id="sbt">TutorBot</span></span></div>
+</div>
+<div class="quick" id="quick"><div class="q-title" id="qt"></div><div class="q-in ph" id="qin"></div><ul id="ql"></ul></div>
+<div class="toast" id="toast"></div>
+<div class="caption"><div id="cap"></div></div>
+<svg class="cursor" id="cursor" viewBox="0 0 24 24"><path d="M4 2.5v17.2l4.6-4.4 3 6.9 3-1.3-3-6.8 6.4-.4z" fill="#ffffff" stroke="#000000" stroke-width="1.3" stroke-linejoin="round"/></svg>
+<div class="end" id="end">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 9.5 12 5l10 4.5-10 4.5z"/><path d="M6 11.3V16c0 1.4 2.7 3 6 3s6-1.6 6-3v-4.7"/><path d="M22 9.5v5"/></svg>
+  <h1>TutorBot</h1><p>Your AI tutor, inside VS Code</p>
+  <div class="pills"><span>Lessons</span><span>Graded quizzes</span><span>Coding exercises</span><span>Spaced review</span><span>Progress</span></div>
+</div>
+
+<script src="../media/vendor/katex.min.js"></script>
+<script src="../media/vendor/highlight.min.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const chat = $("chat"), dash = $("dash");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let T0 = 0;
+// The stage never scrolls (focus or selection changes inside the panel could).
+window.addEventListener("scroll", () => window.scrollTo(0, 0));
+const at = async (ms) => { const wait = T0 + ms - performance.now(); if (wait > 0) await sleep(wait); };
+
+// ── messages: the stage plays the extension host ────────────────────────────
+const toChat = (m) => chat.contentWindow.postMessage(m, "*");
+const rpc = (event) => toChat({ type: "rpc", event });
+const fromChat = [];
+let chatReady = false, dashReady = false;
+window.addEventListener("message", (e) => {
+  const d = e.data || {};
+  if (d.from === "chat") { if (d.m.type === "ready") chatReady = true; fromChat.push(d.m); }
+  if (d.from === "dashboard" && d.m.type === "ready") dashReady = true;
+});
+const waitFor = async (pred, ms = 4000) => { const t = performance.now(); while (!pred()) { if (performance.now() - t > ms) throw new Error("timed out"); await sleep(16); } };
+const nextFromChat = async (type) => { await waitFor(() => fromChat.some((m) => m.type === type)); return fromChat.splice(fromChat.findIndex((m) => m.type === type), 1)[0]; };
+
+// ── cursor & clicks inside the real panel ───────────────────────────────────
+const cur = $("cursor");
+let cx = 900, cy = 640;
+cur.style.transform = `translate(${cx}px, ${cy}px)`;
+function centerOf(el, frame) {
+  const r = el.getBoundingClientRect();
+  const f = frame ? frame.getBoundingClientRect() : { left: 0, top: 0 };
+  return [f.left + r.left + Math.min(r.width / 2, 60), f.top + r.top + r.height / 2];
+}
+async function moveTo(x, y, ms = 450) { cur.style.transition = `transform ${ms}ms cubic-bezier(.3,.7,.3,1)`; cx = x; cy = y; cur.style.transform = `translate(${x - 4}px, ${y - 2}px)`; await sleep(ms); }
+function ripple() { const r = document.createElement("div"); r.className = "ripple"; r.style.left = cx + "px"; r.style.top = cy + "px"; document.body.appendChild(r); setTimeout(() => r.remove(), 500); }
+const inChat = (sel) => chat.contentDocument.querySelector(sel);
+// Show the newest card, smoothly, the way the panel follows a live session.
+const toBottom = () => { const t = inChat(".transcript"); if (t) t.scrollTo({ top: t.scrollHeight, behavior: "smooth" }); };
+async function clickChat(sel, ms) {
+  await waitFor(() => inChat(sel));
+  const el = inChat(sel);
+  await moveTo(...centerOf(el, chat), ms);
+  ripple();
+  el.click();
+}
+async function typeChat(text, ms) {
+  const box = inChat(".box textarea");
+  box.focus();
+  for (let i = 1; i <= text.length; i++) { box.value = text.slice(0, i); box.dispatchEvent(new Event("input", { bubbles: true })); await sleep(ms / text.length); }
+}
+
+// ── stage helpers ───────────────────────────────────────────────────────────
+function caption(title, sub) {
+  const c = $("cap");
+  c.classList.remove("on");
+  setTimeout(() => { c.innerHTML = `${title}${sub ? `<small>${sub}</small>` : ""}`; c.classList.add("on"); }, 120);
+}
+function tabs(list, on) {
+  $("tabs").innerHTML = list.map(([name, icon]) => `<div class="tab${name === on ? " on" : ""}">${icon || ""}${name}</div>`).join("");
+}
+function show(id) { for (const k of ["notes", "code", "dash"]) $(k).hidden = k !== id; }
+function status(text, cls) { $("sbt").textContent = text; $("sb").className = `tb ${cls || ""}`; }
+function renderMathIn(el) {
+  el.innerHTML = el.innerHTML.replace(/\$([^$]+)\$/g, (_, tex) => katex.renderToString(tex, { throwOnError: false }));
+}
+
+// The exercise file, highlighted, with an optional squiggle and caret line.
+function paintCode(lines, { caretLine, squig = -1 } = {}) {
+  $("code").innerHTML = lines.map((src, i) => {
+    let html = hljs.highlight(src || " ", { language: "python" }).value;
+    // A compile error underlines the line's code (after its indentation).
+    if (squig === i) html = html.replace(/^(\s*)([\s\S]*)$/, '$1<span class="squig">$2</span>');
+    return `<div class="ln${caretLine === i ? " cur" : ""}"><span class="no">${i + 1}</span><span>${html}${caretLine === i ? '<span class="caret"></span>' : ""}</span></div>`;
+  }).join("");
+}
+
+const exercise = (status) => toChat({ type: "exercise", exercise: { id: "ex1", file: EX_FILE, title: "Numerical derivative", status } });
+const EX_FILE = "/Users/you/TutorBot/Exercises/Calculus I/numerical-derivative/main.py";
+const tests = (pass) => [
+  { name: "f(x) = x² at x = 3 → 6", pass: true },
+  { name: "f(x) = sin x at x = 0 → 1", pass: pass },
+  { name: "f(x) = eˣ at x = 1 → e", pass: pass },
+  { name: "f(x) = |x| at x = 2 → 1", pass: true },
+];
+
+async function stream(text, ms) {
+  rpc({ type: "message_start", message: { role: "assistant", content: [] } });
+  const step = 7;
+  for (let i = 0; i < text.length; i += step) {
+    rpc({ type: "message_update", assistantMessageEvent: { type: "text_delta", contentIndex: 0, delta: text.slice(i, i + step) } });
+    await sleep(ms / Math.ceil(text.length / step));
+  }
+  rpc({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text }] } });
+}
+
+const LESSON =
+  "The **chain rule** differentiates a function inside another function:\n\n" +
+  "$$\\frac{d}{dx}\\,f\\big(g(x)\\big) = f'\\big(g(x)\\big)\\cdot g'(x)$$\n\n" +
+  "Differentiate the outside, keep the inside, then multiply by the inside's derivative. " +
+  "For $\\sin(3x)$: $\\cos(3x)\\cdot 3 = 3\\cos(3x)$.";
+const Q_OPTIONS = [
+  { index: 1, label: "$\\cos(x^2)$" },
+  { index: 2, label: "$2x\\cos(x^2)$" },
+  { index: 3, label: "$2\\cos(x)$" },
+  { index: 4, label: "$x^2\\cos(x^2)$" },
+];
+const QUESTION = "What is $\\dfrac{d}{dx}\\,\\sin(x^2)$?";
+
+async function play() {
+  await waitFor(() => chatReady && dashReady, 10000);
+  renderMathIn($("notes"));
+  tabs([["week5-notes.md"]], "week5-notes.md");
+  show("notes");
+  dash.contentWindow.postMessage({ type: "data", data: DASH, active: "Calculus I", selected: "Calculus I" }, "*");
+  toChat({ type: "connection", state: "running" });
+  toChat({ type: "model", model: "no model" });
+  toChat({ type: "needsKey" });
+  await sleep(300);
+  // The recorder starts capturing, then says go: the timeline and the video
+  // share one t=0.
+  window.__ready = true;
+  await waitFor(() => window.__go, 20000);
+  T0 = performance.now();
+  window.__t0wall = Date.now();
+
+  // 1 · Connect a key (0.0 – 2.3 s)
+  caption("Bring your own API key", "Anthropic, OpenAI, Gemini, OpenRouter and more · stored in your keychain");
+  await at(350);
+  await clickChat('[data-act="connect-key"]', 500);
+  await nextFromChat("connectKey");
+  $("qt").textContent = "Connect an API key to TutorBot";
+  $("qin").textContent = "Which AI provider is your key from?";
+  $("qin").className = "q-in ph";
+  $("ql").innerHTML = [["Anthropic (Claude)", "ANTHROPIC_API_KEY"], ["OpenAI", "OPENAI_API_KEY"], ["Google Gemini", "GEMINI_API_KEY"], ["OpenRouter", "OPENROUTER_API_KEY"]].map(([a, b], i) => `<li class="${i === 0 ? "sel" : ""}">${a}<span>${b}</span></li>`).join("");
+  $("quick").style.display = "block";
+  await at(1150);
+  await moveTo(560, 112, 300); ripple();
+  $("qt").textContent = "Anthropic (Claude) API key";
+  $("ql").innerHTML = "";
+  $("qin").className = "q-in";
+  for (let i = 1; i <= 22; i++) { $("qin").textContent = "•".repeat(i); await sleep(14); }
+  await at(1800);
+  $("quick").style.display = "none";
+  toChat({ type: "clear" });
+  toChat({ type: "connection", state: "running" });
+  toChat({ type: "model", model: "anthropic/claude-sonnet-5-5" });
+  $("toast").innerHTML = "<b>ⓘ</b> Anthropic (Claude) connected. TutorBot is using anthropic/claude-sonnet-5-5.";
+  $("toast").style.display = "flex";
+
+  // 2 · Pick a subject (2.3 – 4.0 s)
+  await at(2050);
+  caption("Pick a subject, point it at your class folder", "It teaches in your course's notation, order and question style");
+  toChat({ type: "dialog", request: { type: "extension_ui_request", id: "home", method: "select", title: "TutorBot Home — what are we studying?", options: ["Calculus I · continue", "Intro to Java", "＋ New subject", "Just chat"] } });
+  await at(2700);
+  $("toast").style.display = "none";
+  await clickChat('[data-dopt="0"]', 450);
+  await nextFromChat("uiResponse");
+  toChat({ type: "subject", subject: "Calculus I" });
+  toChat({ type: "folders", folders: [{ name: "MATH 151", path: "/Users/you/Courses/MATH 151" }] });
+  status("TutorBot · Calculus I · 3 due");
+
+  // 3 · A lesson with typeset math (4.0 – 6.6 s)
+  await at(3600);
+  caption("Lessons that build one idea at a time", "Math is typeset · grounded in your class materials");
+  await moveTo(1010, 700, 350);
+  await typeChat("Teach me the chain rule", 450);
+  await clickChat('[data-act="send"]', 250);
+  const sent = await nextFromChat("send");
+  rpc({ type: "agent_start" });
+  rpc({ type: "message_start", message: { role: "user", content: [{ type: "text", text: sent.text }] } });
+  await stream(LESSON, 1300);
+
+  // 4 · A graded quiz (6.6 – 9.6 s)
+  await at(6000);
+  caption("Graded quizzes, checked before you see them", "Confidence rating · explain-it-back · hints that never give it away");
+  rpc({ type: "message_start", message: { role: "assistant", content: [] } });
+  rpc({ type: "tool_execution_start", toolCallId: "q1", toolName: "quiz", args: { question: QUESTION, purpose: "check", subject: "Calculus I", concepts: ["Chain rule"] } });
+  setTimeout(toBottom, 60);
+  toChat({ type: "ask", ask: { id: "ask-q1", kind: "quiz", toolCallId: "q1", question: QUESTION, purpose: "check", hints: ["What's the inside function, and what's its derivative?"], options: Q_OPTIONS } });
+  await at(6800);
+  await clickChat('[data-opt="2"]', 450);
+  await at(7450);
+  await clickChat('[data-act="conf"][data-level="3"]', 350);
+  const ans = await nextFromChat("answer");
+  toChat({ type: "askDone", id: ans.id });
+  rpc({
+    type: "tool_execution_end", toolCallId: "q1", toolName: "quiz", isError: false,
+    result: { content: [{ type: "text", text: "The learner was right." }], details: { status: "answered", mode: "single-select", question: QUESTION, answers: [{ index: 2, label: Q_OPTIONS[1].label, value: "b" }], correctIndices: [2], options: Q_OPTIONS, correct: true, dontKnow: false, confidence: 3, hintsUsed: 0, hintsAvailable: 1, explanation: "Outside: $\\sin(u) \\to \\cos(u)$. Inside: $x^2 \\to 2x$. Multiply: $2x\\cos(x^2)$." } },
+  });
+
+  // 5 · A coding exercise, tested as you type (9.6 – 12.6 s)
+  await at(8900);
+  caption("Coding exercises, tested as you type", "Squiggles for errors · Submit ⌘⌥↵ · Hint ⌘⌥H");
+  rpc({ type: "tool_execution_start", toolCallId: "e1", toolName: "assign_exercise", args: { title: "Numerical derivative", language: "python", prompt: "Write `derivative(f, x)` that approximates $f'(x)$ with a small step $h$." } });
+  setTimeout(toBottom, 60);
+  setTimeout(toBottom, 400);
+  toChat({ type: "ask", ask: { id: "ask-e1", kind: "code", toolCallId: "e1", title: "Numerical derivative", prompt: "Write `derivative(f, x)` that approximates $f'(x)$ with a small step $h$.", language: "python", file: EX_FILE, fileName: "main.py" } });
+  const lines = ["def derivative(f, x, h=1e-5):", '    """Approximate f\'(x)."""', "    return (f(x + h) - f(x)) / h", "", "", "print(derivative(lambda x: x**2, 3))"];
+  tabs([["week5-notes.md"], ["main.py", '<span class="dot"></span>']], "main.py");
+  show("code");
+  paintCode(lines, { caretLine: 2 });
+  exercise({ passed: 2, total: 4, results: tests(false) });
+  status("Numerical derivative: 2/4 tests", "fail");
+  await at(9700);
+  // A typo first: the squiggle shows up live.
+  lines[2] = "    return (f(x + h) - f(x - h) / (2 * h)";
+  paintCode(lines, { caretLine: 2, squig: 2 });
+  exercise({ passed: 0, total: 4, compileError: "line 3: '(' was never closed" });
+  status("Numerical derivative: doesn't compile", "fail");
+  await at(10350);
+  lines[2] = "    return (f(x + h) - f(x - h)) / (2 * h)";
+  paintCode(lines, { caretLine: 2 });
+  exercise({ running: true, passed: 0, total: 4 });
+  status("Numerical derivative: testing…");
+  await at(10750);
+  exercise({ passed: 4, total: 4, results: tests(true) });
+  status("Numerical derivative: 4/4 tests", "pass");
+
+  // 6 · Progress & spaced review (12.2 – 14.3 s)
+  await at(11500);
+  caption("See what you know, what's fading, what's left", "Spaced review · no-help checkpoints · exam coverage");
+  await clickChat('[data-act="dashboard"]', 350);
+  tabs([["week5-notes.md"], ["main.py"], ["TutorBot Progress"]], "TutorBot Progress");
+  show("dash");
+  await moveTo(560, 420, 900);
+
+  // End card (14.3 – 15.0 s)
+  await at(14050);
+  $("cap").classList.remove("on");
+  $("end").classList.add("on");
+  await at(15200);
+  window.__done = true;
+}
+
+let DASH = null;
+fetch("build/dashboard-data.json").then((r) => r.json()).then((d) => { DASH = d; return play(); }).catch((e) => { window.__error = String(e && e.stack || e); console.error(e); });
+</script>
+</body></html>

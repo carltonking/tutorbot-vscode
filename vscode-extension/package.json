@@ -2,6 +2,11 @@
   "name": "tutorbot",
   "displayName": "TutorBot",
   "description": "TutorBot in VS Code: a Claude Code–style chat panel with typeset math, interactive quizzes, coding exercises checked as you type, and a progress dashboard.",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/carltonking/tutorbot-vscode.git",
+    "directory": "vscode-extension"
+  },
   "version": "0.10.0",
   "publisher": "carltonking",
   "license": "UNLICENSED",
@@ -252,10 +257,13 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.85.1",
+    "@vscode/vsce": "3.6.2",
+    "playwright-core": "1.56.1",
     "ts-fsrs": "5.4.2"
   },
   "scripts": {
     "build-runtime": "node scripts/build-runtime.mjs",
-    "vscode:prepublish": "npm run build-runtime"
+    "vscode:prepublish": "npm run build-runtime",
+    "package": "vsce package --baseImagesUrl https://github.com/carltonking/tutorbot-vscode/raw/HEAD/vscode-extension --baseContentUrl https://github.com/carltonking/tutorbot-vscode/blob/HEAD/vscode-extension"
   }
 }

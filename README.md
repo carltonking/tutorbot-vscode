@@ -1,5 +1,7 @@
 # TutorBot
 
+![TutorBot demo](vscode-extension/images/demo.gif)
+
 A personal AI tutor that lives in VS Code. Pick a subject, point it at your class materials, and it teaches you step by step, checks what you understood with graded quizzes and coding exercises, and schedules spaced reviews so it sticks. Your progress, notes and learner profile persist across sessions.
 
 ## Getting started
@@ -55,7 +57,7 @@ State lives in `Tutor/` in your TutorBot folder (`~/TutorBot` by default): `Prog
 ```bash
 cd vscode-extension
 npm install                  # pinned pi + ts-fsrs, used only at build time
-npx @vscode/vsce package     # bundles runtime/, then packages the .vsix
+npm run package              # bundles runtime/, then packages the .vsix
 code --install-extension tutorbot-<version>.vsix
 ```
 
