@@ -8,7 +8,7 @@
     "url": "https://github.com/carltonking/tutorbot-vscode.git",
     "directory": "vscode-extension"
   },
-  "version": "0.12.2",
+  "version": "0.12.3",
   "publisher": "CarltonKing",
   "license": "MIT",
   "engines": {

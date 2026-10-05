@@ -1,6 +1,6 @@
 # TutorBot for VS Code
 
-A minimalist chat panel for TutorBot. Click the TutorBot icon (graduation cap) in the activity bar, or press ⌘Esc.
+A minimalist tutor chat for VS Code. Click the TutorBot icon (graduation cap) in the activity bar to see your subjects, click one to chat about it, or press ⌘Esc. The chat opens as its own editor tab.
 
 ![TutorBot in 15 seconds: connect a key, pick a subject, a lesson with typeset math, a graded quiz, a coding exercise tested as you type, and the progress dashboard](images/demo.gif)
 
@@ -13,8 +13,10 @@ Optional tools TutorBot uses when they're installed: `java` and `python3` for Ja
 TutorBot runs on your own AI provider key. The first time you open the panel, it asks you to connect one:
 
 1. Click **Connect API key** in the panel (or run **TutorBot: Connect API Key** from the command palette).
-2. Pick your provider: Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek, Mistral, Groq or xAI.
+2. Pick your provider: Anthropic, OpenAI, Google Gemini, OpenRouter, DeepSeek, Mistral, Groq, xAI, or **FreeLLMAPI (or another OpenAI-compatible server)**.
 3. Paste the key.
+
+For FreeLLMAPI or another OpenAI-compatible server, TutorBot first asks for the server address (default `http://127.0.0.1:31415/v1`, a FreeLLMAPI server running on your computer), then the key. It reads the server's model list, so the server must be running when you connect. FreeLLMAPI's `auto` model is used unless you pick another.
 
 The key is stored in your system keychain (VS Code Secret Storage) and is only passed to the TutorBot process the panel starts. It isn't written to any file or settings. TutorBot then picks a model automatically; change it any time with **TutorBot: Change Model** (or click the model name in the panel footer). To forget a key, run **TutorBot: Remove API Key**.
 
@@ -22,8 +24,8 @@ A key already set in your shell environment (e.g. `ANTHROPIC_API_KEY`) also work
 
 - **Chat**: replies stream in with typeset math and highlighted code. Tool steps show as compact rows you can expand.
 - **Quizzes in place**: click an option or press 1–9. Typed answers have their own box, and the answer and explanation show right after you answer.
-- **Home**: the home button or `/home` lets you switch subject, start a new subject, or just chat. New Chat is in the `…` menu.
-- **Conversations**: the panel's `…` menu → Conversations (or the command palette) shows every conversation, grouped by subject. Click one to open it. Hover and use the pencil to rename a conversation or a subject (renaming a subject keeps its progress and history), or the trash can to delete a conversation. Deleted conversations go to the Trash; your progress, grades and review schedule are kept.
+- **Subjects**: the TutorBot sidebar lists your subjects (classes). Click one to open the chat in it, or **+ Add class** to add one. Hover a subject to rename or remove it (removing can keep or delete its progress); expand it to add or remove its class folders. In the chat, the home button or `/home` also switches subject, starts a new one, or just chats. New Chat is in the sidebar's `…` menu and the chat tab's title bar.
+- **Conversations**: the sidebar's `…` menu → Conversations (or the command palette) shows every conversation, grouped by subject. Click one to open it. Hover and use the pencil to rename a conversation or a subject (renaming a subject keeps its progress and history), or the trash can to delete a conversation. Deleted conversations go to the Trash; your progress, grades and review schedule are kept.
 - **Progress**: the chart button in the header (or *TutorBot: Open Progress*) opens a dashboard tab. It shows memory (fades between reviews) and proof level for every concept, across the whole course map, with upcoming exams as coverage plus an at-risk list. Buttons there (Teach me, Check, Practice, Checkpoint) run in the chat. It reads TutorBot's files directly, so it works without TutorBot running and updates live.
 - **Coding exercises**: the file opens in the editor and the tests re-run as you type. Errors show as squiggles. Use Submit (⌘⌥↵) and Hint (⌘⌥H).
 - **Ask about code**: select code, then ⌘⌥K or right-click → *Ask TutorBot About This Code*.

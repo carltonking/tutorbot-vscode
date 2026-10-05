@@ -6,6 +6,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { getBridge } from "../lib/bridge.ts";
+import { registerCustomProvider } from "../lib/custom-provider.ts";
 import { coerceJsonArgs } from "../lib/coerce.ts";
 import { ANSWER_KEY_PATH, ASSESSMENT_PATH, displayPath, folderExists, ResourceIndex } from "../lib/resources.ts";
 import { displayedFields, findPlainMath, looksLikeTextQuiz, repairInputMath } from "../lib/plain-math.ts";
@@ -165,6 +166,7 @@ function checkpointPrompt(store: TutorStore, data: ReturnType<TutorStore["loadPr
 }
 
 export default function tutor(pi: ExtensionAPI) {
+	registerCustomProvider(pi);
 	let store: TutorStore | undefined;
 	let index: ResourceIndex | undefined;
 	let registry: SubjectRegistry | undefined;

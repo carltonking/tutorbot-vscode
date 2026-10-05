@@ -94,8 +94,25 @@ const PROVIDERS = [
   { id: "mistral", label: "Mistral", env: "MISTRAL_API_KEY", url: "https://console.mistral.ai/api-keys" },
   { id: "groq", label: "Groq", env: "GROQ_API_KEY", url: "https://console.groq.com/keys" },
   { id: "xai", label: "xAI (Grok)", env: "XAI_API_KEY", url: "https://console.x.ai" },
+  // Any OpenAI-compatible server; TutorBot registers it (extensions/lib/custom-provider.ts).
+  { id: "freellmapi", label: "FreeLLMAPI (or another OpenAI-compatible server)", env: "TUTORBOT_FREELLMAPI_KEY", custom: true },
 ];
 const secretKey = (provider) => `tutorbot.apiKey.${provider}`;
+const CUSTOM_CONFIG = "tutorbot.freellmapi.config"; // {baseUrl, models}
+const CUSTOM_DEFAULT_URL = "http://127.0.0.1:31415/v1";
+
+// The server's model ids (GET /models), so they can be picked in Change Model.
+async function fetchModelIds(baseUrl, key) {
+  const res = await fetch(`${baseUrl.replace(/\/+$/, "")}/models`, {
+    headers: key ? { Authorization: `Bearer ${key}` } : {},
+    signal: AbortSignal.timeout(8000),
+  });
+  if (!res.ok) throw new Error(`the server answered ${res.status} ${res.statusText}`);
+  const body = await res.json();
+  const ids = (Array.isArray(body && body.data) ? body.data : []).map((m) => m && m.id).filter((id) => typeof id === "string" && id);
+  if (!ids.length) throw new Error("the server listed no models");
+  return ids;
+}
 
 let secrets;
 async function storedKeyEnv() {
@@ -104,6 +121,8 @@ async function storedKeyEnv() {
     const key = await secrets.get(secretKey(p.id));
     if (key) env[p.env] = key;
   }
+  const custom = await secrets.get(CUSTOM_CONFIG);
+  if (custom && env.TUTORBOT_FREELLMAPI_KEY) env.TUTORBOT_FREELLMAPI = custom;
   return env;
 }
 
@@ -417,11 +436,12 @@ class Controller {
   async connectApiKey() {
     const connected = new Set((await connectedProviders()).map((p) => p.id));
     const pick = await vscode.window.showQuickPick(
-      PROVIDERS.map((p) => ({ label: p.label, description: connected.has(p.id) ? "connected · replace key" : p.env, provider: p })),
+      PROVIDERS.map((p) => ({ label: p.label, description: connected.has(p.id) ? "connected · replace key" : p.custom ? "server address + key" : p.env, provider: p })),
       { title: "Connect an API key to TutorBot", placeHolder: "Which AI provider is your key from?" },
     );
     if (!pick) return;
     const p = pick.provider;
+    if (p.custom) return this.connectCustom(p);
     const key = await vscode.window.showInputBox({
       title: `${p.label} API key`,
       prompt: `Paste your ${p.label} API key. It's stored in your system keychain and only passed to TutorBot. Get one at ${p.url}`,
@@ -431,6 +451,53 @@ class Controller {
     });
     if (!key) return;
     await secrets.store(secretKey(p.id), key.trim());
+    return this.afterConnect(p, connected);
+  }
+
+  // FreeLLMAPI / OpenAI-compatible: server address, key, then its model list.
+  async connectCustom(p) {
+    const connected = new Set((await connectedProviders()).map((x) => x.id));
+    let saved = {};
+    try {
+      saved = JSON.parse((await secrets.get(CUSTOM_CONFIG)) || "{}");
+    } catch {
+      // start over
+    }
+    const baseUrl = await vscode.window.showInputBox({
+      title: `${p.label}: server address`,
+      prompt: "The server's OpenAI-compatible base URL, usually ending in /v1. FreeLLMAPI running on this computer is the default.",
+      value: saved.baseUrl || CUSTOM_DEFAULT_URL,
+      ignoreFocusOut: true,
+      validateInput: (v) => (/^https?:\/\/\S+$/i.test(v.trim()) ? undefined : "Enter a URL starting with http:// or https://"),
+    });
+    if (!baseUrl) return;
+    const key = await vscode.window.showInputBox({
+      title: `${p.label}: API key`,
+      prompt: "Paste the key for this server. It's stored in your system keychain and only passed to TutorBot.",
+      password: true,
+      ignoreFocusOut: true,
+      validateInput: (v) => (!v.trim() ? "Paste a key" : /\s/.test(v.trim()) ? "A key has no spaces" : undefined),
+    });
+    if (!key) return;
+    const url = baseUrl.trim().replace(/\/+$/, "");
+    let models;
+    try {
+      models = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: `Connecting to ${url}…` }, () => fetchModelIds(url, key.trim()));
+    } catch (e) {
+      const msg = e && e.name === "TimeoutError" ? "it didn't answer within 8 seconds" : e.message;
+      const retry = await vscode.window.showErrorMessage(`Couldn't reach ${url}: ${msg}. Is the server running, and is the address right?`, "Try Again");
+      if (retry) return this.connectCustom(p);
+      return;
+    }
+    await secrets.store(CUSTOM_CONFIG, JSON.stringify({ baseUrl: url, models }));
+    await secrets.store(secretKey(p.id), key.trim());
+    log(`${p.id}: ${url}, ${models.length} model(s)`);
+    // FreeLLMAPI's "auto" router picks a working model per request: prefer it.
+    if (!cfg("model") && models.includes("auto")) await vscode.workspace.getConfiguration("tutorbot").update("model", `${p.id}/auto`, vscode.ConfigurationTarget.Global);
+    return this.afterConnect(p, connected);
+  }
+
+  async afterConnect(p, connected) {
     this.keyPrompted = false;
     log(`API key saved for ${p.id}`);
     // A model pinned to a provider without a key would keep failing: go automatic.
@@ -454,6 +521,7 @@ class Controller {
     );
     if (!pick) return;
     await secrets.delete(secretKey(pick.provider.id));
+    if (pick.provider.custom) await secrets.delete(CUSTOM_CONFIG);
     log(`API key removed for ${pick.provider.id}`);
     vscode.window.showInformationMessage(`${pick.provider.label} key removed.`);
     this.restart();
