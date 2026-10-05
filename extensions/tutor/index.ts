@@ -238,13 +238,14 @@ export default function tutor(pi: ExtensionAPI) {
 		for (const e of ctx.sessionManager.getBranch() as any[]) {
 			if (e?.type === "custom" && e.customType === SUBJECT_ENTRY) activeSubject = e.data?.subject;
 		}
-		// A subject renamed since this session was tagged resolves to its new name.
-		if (activeSubject) activeSubject = registry.resolve(activeSubject);
+		// A subject renamed since this session was tagged resolves to its new name;
+		// one removed from the subject list (VS Code directory) is dropped.
+		if (activeSubject) activeSubject = registry.has(activeSubject) ? registry.resolve(activeSubject) : undefined;
 		// New Chat keeps the subject you were studying (unless you chose "Just chat").
 		const freeChat = Boolean(g.__tutorFreeChat);
 		g.__tutorFreeChat = false;
 		const carried = event.reason === "new" && !pending && !activeSubject && !freeChat ? (subjectTagOf(event.previousSessionFile) ?? g.__tutorLastSubject) : undefined;
-		const tag = pending ?? (carried ? registry.resolve(carried) : undefined);
+		const tag = pending ?? (carried && registry.has(carried) ? registry.resolve(carried) : undefined);
 		if (tag) {
 			activeSubject = tag;
 			pi.appendEntry(SUBJECT_ENTRY, { subject: tag });
@@ -262,8 +263,9 @@ export default function tutor(pi: ExtensionAPI) {
 		registerLearningApi(ctx);
 		maybeWriteWeekly(ctx);
 
-		// Started by the VS Code panel: open the subject picker first.
-		if (event.reason === "startup" && process.env.TUTORBOT === "1" && !g.__tutorbotPickerShown) {
+		// Started by the VS Code panel: open the subject picker first — unless it
+		// was started from the subject directory, which picks the subject itself.
+		if (event.reason === "startup" && process.env.TUTORBOT === "1" && process.env.TUTORBOT_NO_PICKER !== "1" && !g.__tutorbotPickerShown) {
 			g.__tutorbotPickerShown = true;
 			setTimeout(() => pi.sendUserMessage("/subject", { expandPromptTemplates: true }), 300);
 		}
@@ -489,6 +491,23 @@ export default function tutor(pi: ExtensionAPI) {
 		});
 
 		bridge.onApi("renameSubject", async (body) => renameSubjectEverywhere(ctx, String(body?.from ?? ""), String(body?.to ?? "")));
+
+		// Remove a subject from the list (VS Code directory). Its conversations
+		// stay; its progress is deleted only when asked.
+		bridge.onApi("removeSubject", async (body) => {
+			const name = String(body?.name ?? "").trim();
+			const removed = name ? registry.remove(name) : undefined;
+			if (!removed) return { ok: false, error: `No subject named "${name}".` };
+			const concepts = body?.deleteProgress ? store.deleteSubject(removed.name) : 0;
+			const g = globalThis as any;
+			if (g.__tutorLastSubject && slug(g.__tutorLastSubject) === slug(removed.name)) g.__tutorLastSubject = undefined;
+			if (activeSubject && slug(activeSubject) === slug(removed.name)) {
+				activeSubject = undefined;
+				getBridge().setState("subject", null);
+				showSubjectStatus(ctx);
+			}
+			return { ok: true, name: removed.name, concepts };
+		});
 	}
 
 	// Rename a subject: registry (old name kept as an alias), progress, topic
@@ -1615,8 +1634,15 @@ ${resources}
 
 			// `/home <name> --continue` (dashboard actions): switch with no dialogs;
 			// resume the last session, else a quiet fresh one.
+			// `/home <name> --new` (VS Code directory): always a new subject, even
+			// when the name is a prefix of an existing one.
 			const quiet = /\s--continue\s*$/.test(args ?? "");
-			const wanted = (args ?? "").replace(/\s--continue\s*$/, "").trim();
+			const fresh = /\s--new\s*$/.test(args ?? "");
+			const wanted = (args ?? "").replace(/\s--(continue|new)\s*$/, "").trim();
+			if (wanted && fresh) {
+				await newSubject(wanted);
+				return;
+			}
 			if (wanted && quiet) {
 				// Exact name (or a renamed subject's old name) only: find() also matches
 				// prefixes ("Java" → "JavaScript").

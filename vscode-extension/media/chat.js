@@ -2121,6 +2121,10 @@
         updateSendButton();
         return t.focus();
       }
+      case "focus":
+        // Open Chat: put the cursor where the learner acts next.
+        if (!focusLive()) input().focus();
+        return;
       case "insertContext": {
         const t = input();
         t.value = (t.value ? `${t.value}\n` : "") + m.text;

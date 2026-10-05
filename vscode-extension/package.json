@@ -8,7 +8,7 @@
     "url": "https://github.com/carltonking/tutorbot-vscode.git",
     "directory": "vscode-extension"
   },
-  "version": "0.11.0",
+  "version": "0.12.2",
   "publisher": "CarltonKing",
   "license": "MIT",
   "engines": {
@@ -19,7 +19,8 @@
   ],
   "main": "./extension.js",
   "activationEvents": [
-    "onStartupFinished"
+    "onStartupFinished",
+    "onWebviewPanel:tutorbot.chat"
   ],
   "contributes": {
     "commands": [
@@ -27,7 +28,7 @@
         "command": "tutorbot.focus",
         "title": "Open Chat",
         "category": "TutorBot",
-        "icon": "$(mortar-board)"
+        "icon": "$(comment-discussion)"
       },
       {
         "command": "tutorbot.dashboard",
@@ -106,43 +107,100 @@
         "command": "tutorbot.openExercise",
         "title": "Open Current Exercise",
         "category": "TutorBot"
+      },
+      {
+        "command": "tutorbot.openSubject",
+        "title": "Open Subject",
+        "category": "TutorBot",
+        "icon": "$(comment-discussion)"
+      },
+      {
+        "command": "tutorbot.newSubject",
+        "title": "New Subject",
+        "category": "TutorBot",
+        "icon": "$(add)"
+      },
+      {
+        "command": "tutorbot.renameSubject",
+        "title": "Rename Subject",
+        "category": "TutorBot",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "tutorbot.removeSubject",
+        "title": "Remove Subject",
+        "category": "TutorBot",
+        "icon": "$(trash)"
+      },
+      {
+        "command": "tutorbot.addSubjectFolder",
+        "title": "Add Class Folder",
+        "category": "TutorBot",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "tutorbot.removeSubjectFolder",
+        "title": "Remove Class Folder",
+        "category": "TutorBot",
+        "icon": "$(close)"
+      },
+      {
+        "command": "tutorbot.refreshSubjects",
+        "title": "Refresh Subjects",
+        "category": "TutorBot",
+        "icon": "$(refresh)"
       }
     ],
     "menus": {
       "view/title": [
         {
+          "command": "tutorbot.newSubject",
+          "when": "view == tutorbot.directory",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tutorbot.focus",
+          "when": "view == tutorbot.directory",
+          "group": "navigation@2"
+        },
+        {
           "command": "tutorbot.dashboard",
-          "when": "view == tutorbot.chat",
-          "group": "more@0"
+          "when": "view == tutorbot.directory",
+          "group": "navigation@3"
         },
         {
           "command": "tutorbot.newChat",
-          "when": "view == tutorbot.chat",
+          "when": "view == tutorbot.directory",
           "group": "more@0"
         },
         {
           "command": "tutorbot.conversations",
-          "when": "view == tutorbot.chat",
+          "when": "view == tutorbot.directory",
+          "group": "more@0"
+        },
+        {
+          "command": "tutorbot.refreshSubjects",
+          "when": "view == tutorbot.directory",
           "group": "more@0"
         },
         {
           "command": "tutorbot.chooseModel",
-          "when": "view == tutorbot.chat",
+          "when": "view == tutorbot.directory",
           "group": "more@1"
         },
         {
           "command": "tutorbot.connectApiKey",
-          "when": "view == tutorbot.chat",
+          "when": "view == tutorbot.directory",
           "group": "more@1"
         },
         {
           "command": "tutorbot.restart",
-          "when": "view == tutorbot.chat",
+          "when": "view == tutorbot.directory",
           "group": "more@2"
         },
         {
           "command": "tutorbot.showLog",
-          "when": "view == tutorbot.chat",
+          "when": "view == tutorbot.directory",
           "group": "more@3"
         }
       ],
@@ -161,6 +219,31 @@
           "command": "tutorbot.checkFile",
           "when": "resourceLangId =~ /^(python|java|javascript)$/ && !tutorbot.isExerciseFile",
           "group": "navigation@3"
+        },
+        {
+          "command": "tutorbot.newChat",
+          "when": "activeWebviewPanelId == tutorbot.chat",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tutorbot.dashboard",
+          "when": "activeWebviewPanelId == tutorbot.chat",
+          "group": "navigation@2"
+        },
+        {
+          "command": "tutorbot.conversations",
+          "when": "activeWebviewPanelId == tutorbot.chat",
+          "group": "1_tutorbot@1"
+        },
+        {
+          "command": "tutorbot.chooseModel",
+          "when": "activeWebviewPanelId == tutorbot.chat",
+          "group": "1_tutorbot@2"
+        },
+        {
+          "command": "tutorbot.restart",
+          "when": "activeWebviewPanelId == tutorbot.chat",
+          "group": "1_tutorbot@3"
         }
       ],
       "editor/context": [
@@ -191,6 +274,10 @@
         {
           "command": "tutorbot.checkFile",
           "when": "editorLangId =~ /^(python|java|javascript)$/"
+        },
+        {
+          "command": "tutorbot.removeSubjectFolder",
+          "when": "false"
         }
       ],
       "explorer/context": [
@@ -198,6 +285,48 @@
           "command": "tutorbot.checkFile",
           "when": "resourceLangId =~ /^(python|java|javascript)$/",
           "group": "tutorbot@1"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "tutorbot.renameSubject",
+          "when": "view == tutorbot.directory && viewItem == subject",
+          "group": "inline@1"
+        },
+        {
+          "command": "tutorbot.removeSubject",
+          "when": "view == tutorbot.directory && viewItem == subject",
+          "group": "inline@2"
+        },
+        {
+          "command": "tutorbot.openSubject",
+          "when": "view == tutorbot.directory && viewItem == subject",
+          "group": "1_open@1"
+        },
+        {
+          "command": "tutorbot.renameSubject",
+          "when": "view == tutorbot.directory && viewItem == subject",
+          "group": "2_edit@1"
+        },
+        {
+          "command": "tutorbot.addSubjectFolder",
+          "when": "view == tutorbot.directory && viewItem == subject",
+          "group": "2_edit@2"
+        },
+        {
+          "command": "tutorbot.removeSubject",
+          "when": "view == tutorbot.directory && viewItem == subject",
+          "group": "3_remove@1"
+        },
+        {
+          "command": "tutorbot.removeSubjectFolder",
+          "when": "view == tutorbot.directory && viewItem == folder",
+          "group": "inline@1"
+        },
+        {
+          "command": "tutorbot.removeSubjectFolder",
+          "when": "view == tutorbot.directory && viewItem == folder",
+          "group": "1_edit@1"
         }
       ]
     },
@@ -274,13 +403,18 @@
     "views": {
       "tutorbot": [
         {
-          "type": "webview",
-          "id": "tutorbot.chat",
-          "name": "Chat",
+          "id": "tutorbot.directory",
+          "name": "Subjects",
           "icon": "media/icon.svg"
         }
       ]
-    }
+    },
+    "viewsWelcome": [
+      {
+        "view": "tutorbot.directory",
+        "contents": "No subjects yet. Add the classes you're studying, then click one to chat with TutorBot about it.\n[+ Add Class](command:tutorbot.newSubject)\n[Open Chat](command:tutorbot.focus)"
+      }
+    ]
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "0.85.1",

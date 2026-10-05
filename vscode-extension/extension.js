@@ -129,7 +129,7 @@ class TutorProcess {
     return Boolean(this.child && this.child.exitCode === null);
   }
 
-  async start() {
+  async start(opts = {}) {
     const PATH = await resolveShellPath();
     const { nodePath, args, env } = piCommand();
     // Empty = automatic: TutorBot picks a model from the connected providers.
@@ -143,7 +143,7 @@ class TutorProcess {
     if (Object.keys(keys).length) log(`API keys from VS Code: ${Object.keys(keys).join(", ")}`);
     this.child = cp.spawn(nodePath, args, {
       cwd,
-      env: { ...process.env, ...env, ...keys, PATH, TUTORBOT: "1", TUTORBOT_PANEL: "1", TUTORBOT_PANEL_FD: "3", TERM_PROGRAM: "vscode" },
+      env: { ...process.env, ...env, ...keys, PATH, TUTORBOT: "1", TUTORBOT_PANEL: "1", TUTORBOT_PANEL_FD: "3", TERM_PROGRAM: "vscode", ...(opts.noPicker ? { TUTORBOT_NO_PICKER: "1" } : {}) },
       // fd 3: the bridge pipe (see BridgeClient).
       stdio: ["pipe", "pipe", "pipe", "pipe"],
     });
@@ -332,7 +332,9 @@ class Controller {
   }
 
   // ---- lifecycle
-  async ensureStarted() {
+  // noPicker: started from the subject directory, which picks the subject
+  // itself, so TutorBot skips its own startup subject picker.
+  async ensureStarted(opts = {}) {
     if (this.proc && this.proc.running) return;
     this.post({ type: "connection", state: "starting" });
     const proc = new TutorProcess(
@@ -349,8 +351,11 @@ class Controller {
       },
     );
     this.proc = proc;
+    // Learned afresh from the new process's first session.
+    this.resets = 0;
+    this.subject = null;
     try {
-      this.bridge.attach(await this.proc.start());
+      this.bridge.attach(await this.proc.start(opts));
       this.refreshCommands();
     } catch (e) {
       this.post({ type: "connection", state: "stopped", detail: e.message });
@@ -526,6 +531,7 @@ class Controller {
       this.folders = st.folders || [];
       this.post({ type: "subject", subject: this.subject });
       this.post({ type: "folders", folders: this.folders });
+      this.onSubject();
       return this.loadHistory();
     }
     if (event === "state") {
@@ -534,6 +540,7 @@ class Controller {
         this.subject = data.value ?? null;
         if (this.dashboard) this.dashboard.schedule();
         this.post({ type: "subject", subject: this.subject });
+        this.onSubject();
       }
       if (data.key === "folders") {
         this.folders = data.value || [];
@@ -767,6 +774,143 @@ class Controller {
     }
   }
 
+  // ---- subjects (the sidebar directory)
+  // TutorBot started, its first session loaded, and the bridge API up.
+  async ready() {
+    const starting = !(this.proc && this.proc.running);
+    await this.ensureStarted({ noPicker: true });
+    if (!(await waitFor(() => this.resets > 0 && this.bridge.connected, 20000))) throw new Error("TutorBot didn't start. See TutorBot: Show Log.");
+    if (starting) await waitFor(() => !this.running, 10000);
+  }
+
+  // Move the chat to a subject: its last conversation, else a fresh one.
+  async switchSubject(name) {
+    if (this.subject === name) return true;
+    if (this.running) {
+      // Never steer a switch into a reply (or a quiz) that's in progress.
+      this.post({ type: "notice", level: "warning", text: `TutorBot is in the middle of something. Finish or stop it, then switch to ${name}.` });
+      return false;
+    }
+    this.post({ type: "notice", level: "info", text: `Switching to ${name}…` });
+    await this.onWebview({ type: "send", text: `/home ${name} --continue` });
+    if (!(await waitFor(() => this.subject === name, 15000))) {
+      this.post({ type: "notice", level: "warning", text: `Couldn't switch to ${name}. Pick it from Home, then try again.` });
+      return false;
+    }
+    // The subject arrives with the session switch; let any startup turn settle.
+    await waitFor(() => !this.running, 10000);
+    return true;
+  }
+
+  async openSubject(name) {
+    this.reveal();
+    try {
+      await this.ready();
+    } catch (e) {
+      return vscode.window.showErrorMessage(e.message);
+    }
+    await this.switchSubject(name);
+  }
+
+  async newSubject() {
+    const reg = readJson(path.join(dataDir(), "subjects.json"), { subjects: {} });
+    const taken = new Map(Object.entries(reg.subjects || {}).map(([k, v]) => [k, v && v.name]));
+    for (const [k, v] of Object.entries(reg.aliases || {})) if (taken.has(v)) taken.set(k, taken.get(v));
+    const input = await vscode.window.showInputBox({
+      title: "New subject",
+      prompt: "What do you want to learn?",
+      placeHolder: "e.g. Java, Calc II, Organic Chemistry",
+      validateInput: (v) => (!slug(v) ? "Use at least one letter or digit" : taken.has(slug(v)) ? `You already have ${taken.get(slug(v))}. Open it from the list.` : undefined),
+    });
+    const name = (input || "").replace(/\s+/g, " ").trim();
+    if (!name) return;
+    this.reveal();
+    try {
+      await this.ready();
+    } catch (e) {
+      return vscode.window.showErrorMessage(e.message);
+    }
+    if (this.running) {
+      this.post({ type: "notice", level: "warning", text: `TutorBot is in the middle of something. Finish or stop it, then add ${name}.` });
+      return;
+    }
+    // TutorBot asks about a class folder in the chat, then starts the subject.
+    await this.onWebview({ type: "send", text: `/home ${name} --new` });
+  }
+
+  async renameSubject(name) {
+    const input = await vscode.window.showInputBox({ title: `Rename ${name}`, value: name, validateInput: (v) => (!slug(v) ? "Use at least one letter or digit" : undefined) });
+    const to = (input || "").replace(/\s+/g, " ").trim();
+    if (!to || to === name) return;
+    try {
+      await this.ready();
+      const r = await this.bridge.post("renameSubject", { from: name, to });
+      if (!r.ok) throw new Error(r.error || "Rename failed");
+      vscode.window.showInformationMessage(`Renamed ${name} to ${r.name}. Its progress, conversations and class folder moved with it.`);
+    } catch (e) {
+      vscode.window.showErrorMessage(`Couldn't rename ${name}: ${e.message}`);
+    }
+    if (this.directory) this.directory.refresh();
+  }
+
+  async removeSubject(name) {
+    if (this.running && this.subject === name) {
+      return vscode.window.showWarningMessage(`TutorBot is replying in ${name}. Stop it first, then remove the subject.`);
+    }
+    const KEEP = "Remove, Keep Progress";
+    const DELETE = "Remove and Delete Progress";
+    const pick = await vscode.window.showWarningMessage(
+      `Remove ${name} from your subjects?`,
+      {
+        modal: true,
+        detail:
+          "Its conversations stay under Conversations.\n\n" +
+          `Keep Progress: its grades and review schedule stay in Progress, and come back if you add ${name} again.\n` +
+          "Delete Progress: its concepts, grades, review schedule and exam dates are deleted for good.",
+      },
+      KEEP,
+      DELETE,
+    );
+    if (!pick) return;
+    try {
+      await this.ready();
+      const r = await this.bridge.post("removeSubject", { name, deleteProgress: pick === DELETE });
+      if (!r.ok) throw new Error(r.error || "Remove failed");
+      vscode.window.showInformationMessage(pick === DELETE ? `Removed ${r.name} and its progress.` : `Removed ${r.name}. Its progress is kept.`);
+    } catch (e) {
+      vscode.window.showErrorMessage(`Couldn't remove ${name}: ${e.message}`);
+    }
+    if (this.dashboard) this.dashboard.schedule();
+    if (this.directory) this.directory.refresh();
+  }
+
+  async addSubjectFolder(name) {
+    const folder = await this.showFolderDialog(`Choose the folder with your ${name} class materials`);
+    if (!folder) return;
+    try {
+      await this.ready();
+      const r = await this.bridge.post("setFolder", { subject: name, path: folder });
+      if (!r.ok) throw new Error(r.error || "Couldn't add that folder.");
+      vscode.window.showInformationMessage(`${name} now uses ${path.basename(folder)}. Indexing it in the background.`);
+    } catch (e) {
+      vscode.window.showErrorMessage(e.message);
+    }
+    if (this.directory) this.directory.refresh();
+  }
+
+  async removeSubjectFolder(name, folder) {
+    const pick = await vscode.window.showWarningMessage(`Stop using ${path.basename(folder)} for ${name}?`, { modal: true, detail: "The folder itself isn't touched." }, "Remove Folder");
+    if (pick !== "Remove Folder") return;
+    try {
+      await this.ready();
+      const r = await this.bridge.post("setFolder", { action: "remove", path: folder });
+      if (!r.ok) throw new Error(r.error || "Couldn't remove that folder.");
+    } catch (e) {
+      vscode.window.showErrorMessage(e.message);
+    }
+    if (this.directory) this.directory.refresh();
+  }
+
   // ---- exercises (status bar, squiggles, live tests)
   setExercise(ex) {
     const prevFile = this.exercise && this.exercise.file;
@@ -910,9 +1054,12 @@ class Controller {
     );
   }
 
+  // Files open next to the chat tab, never on top of it.
   async openFile(file) {
     const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
-    await vscode.window.showTextDocument(doc, { viewColumn: vscode.ViewColumn.One, preview: false });
+    const chat = this.chat && this.chat.panel;
+    const column = chat && chat.viewColumn === vscode.ViewColumn.One ? vscode.ViewColumn.Two : vscode.ViewColumn.One;
+    await vscode.window.showTextDocument(doc, { viewColumn: column, preview: false });
   }
 
   async saveExerciseDoc() {
@@ -924,7 +1071,7 @@ class Controller {
   async submit() {
     if (!this.exercise) return vscode.window.showInformationMessage("No TutorBot exercise is active.");
     await this.saveExerciseDoc();
-    this.reveal();
+    this.reveal(true);
     this.bridge.post("submit", {}).catch((e) => vscode.window.showErrorMessage(e.message));
   }
 
@@ -933,7 +1080,7 @@ class Controller {
     await this.saveExerciseDoc();
     const question = await vscode.window.showInputBox({ title: "Ask TutorBot for a hint", prompt: "Optional: what are you stuck on? (Enter for the next hint)" });
     if (question === undefined) return;
-    this.reveal();
+    this.reveal(true);
     this.bridge.post("hint", { question: question.trim() || undefined }).catch((e) => vscode.window.showErrorMessage(e.message));
   }
 
@@ -979,8 +1126,18 @@ class Controller {
     }, cfg("liveCheckDelayMs") || 800);
   }
 
-  reveal() {
-    vscode.commands.executeCommand("tutorbot.chat.focus");
+  // Open (or bring forward) the chat tab. preserveFocus: keep typing in the
+  // editor (submit, hint).
+  reveal(preserveFocus) {
+    if (!this.chat) return;
+    this.chat.open(preserveFocus);
+    if (!preserveFocus) this.post({ type: "focus" });
+  }
+
+  // The current subject changed: retitle the chat tab, re-mark the directory.
+  onSubject() {
+    if (this.chat) this.chat.retitle(this.subject);
+    if (this.directory) this.directory.refresh();
   }
 
   dispose() {
@@ -994,6 +1151,13 @@ const CHECKABLE = new Set(["python", "java", "javascript"]);
 function samePath(a, b) {
   return path.resolve(a) === path.resolve(b);
 }
+
+// Same as TutorBot's subject keys (extensions/lib/tutor-store.ts).
+const slug = (text) =>
+  String(text)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 
 // ── progress dashboard (editor tab) ────────────────────────────────────────
 // Reads TutorBot's files directly, so it works whether or not TutorBot is
@@ -1211,22 +1375,9 @@ class DashboardPanel {
     }
     this.busy = true;
     try {
-      const starting = !(c.proc && c.proc.running);
-      await c.ensureStarted();
       // A fresh start restores the last session: learn its subject first.
-      if (starting) await waitFor(() => c.subject !== null || c.resets > 0, 8000);
-      if (m.subject && c.subject !== m.subject) {
-        c.post({ type: "notice", level: "info", text: `Switching to ${m.subject}…` });
-        await c.onWebview({ type: "send", text: `/home ${m.subject} --continue` });
-        const ok = await waitFor(() => c.subject === m.subject, 15000);
-        if (!ok) {
-          c.post({ type: "notice", level: "warning", text: `Couldn't switch to ${m.subject}. Pick it from Home, then try again.` });
-          return;
-        }
-        // The subject arrives with the session switch (or right away when it's
-        // the current session); just let any startup turn settle.
-        await waitFor(() => !c.running, 10000);
-      }
+      await c.ready();
+      if (m.subject && !(await c.switchSubject(m.subject))) return;
       await c.onWebview({ type: "send", text: prompt });
     } finally {
       this.busy = false;
@@ -1266,26 +1417,38 @@ function actionPrompt(m) {
   return undefined;
 }
 
-// ── chat view ──────────────────────────────────────────────────────────────
-class ChatViewProvider {
+// ── chat tab ───────────────────────────────────────────────────────────────
+// The chat lives in an editor tab, so it can take the whole main area. It
+// opens in the active column, or beside the editor when code is open.
+class ChatPanel {
   constructor(context, controller) {
     this.context = context;
     this.controller = controller;
+    this.panel = undefined;
   }
 
-  resolveWebviewView(view) {
+  open(preserveFocus) {
+    if (this.panel) return this.panel.reveal(this.panel.viewColumn, preserveFocus);
+    const column = vscode.window.visibleTextEditors.length ? vscode.ViewColumn.Beside : vscode.ViewColumn.Active;
+    const panel = vscode.window.createWebviewPanel("tutorbot.chat", "TutorBot", { viewColumn: column, preserveFocus }, { retainContextWhenHidden: true });
+    this.setup(panel);
+  }
+
+  // Also used to restore the tab after a window reload (see the serializer).
+  setup(panel) {
     const media = vscode.Uri.joinPath(this.context.extensionUri, "media");
-    view.webview.options = { enableScripts: true, localResourceRoots: [media] };
-    const uri = (p) => view.webview.asWebviewUri(vscode.Uri.joinPath(media, p)).toString();
+    panel.webview.options = { enableScripts: true, localResourceRoots: [media] };
+    panel.iconPath = vscode.Uri.joinPath(media, "icon.svg");
+    const uri = (p) => panel.webview.asWebviewUri(vscode.Uri.joinPath(media, p)).toString();
     const nonce = Array.from({ length: 24 }, () => Math.floor(Math.random() * 36).toString(36)).join("");
     const csp = [
       "default-src 'none'",
-      `img-src ${view.webview.cspSource} data:`,
-      `font-src ${view.webview.cspSource}`,
-      `style-src ${view.webview.cspSource} 'unsafe-inline'`,
+      `img-src ${panel.webview.cspSource} data:`,
+      `font-src ${panel.webview.cspSource}`,
+      `style-src ${panel.webview.cspSource} 'unsafe-inline'`,
       `script-src 'nonce-${nonce}'`,
     ].join("; ");
-    view.webview.html = `<!doctype html>
+    panel.webview.html = `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1299,7 +1462,115 @@ class ChatViewProvider {
 <script nonce="${nonce}" src="${uri("vendor/highlight.min.js")}"></script>
 <script nonce="${nonce}" src="${uri("chat.js")}"></script>
 </body></html>`;
-    this.controller.attach(view);
+    panel.onDidDispose(() => {
+      if (this.panel === panel) this.panel = undefined;
+    });
+    this.panel = panel;
+    this.retitle(this.controller.subject);
+    this.controller.attach(panel);
+  }
+
+  retitle(subject) {
+    if (this.panel) this.panel.title = subject ? `TutorBot · ${subject}` : "TutorBot";
+  }
+}
+
+// ── subject directory (sidebar) ────────────────────────────────────────────
+// Reads TutorBot's subject list straight from its files, so it works before
+// TutorBot is started. Changes go through TutorBot (Controller).
+class SubjectDirectory {
+  constructor(controller) {
+    this.controller = controller;
+    this.emitter = new vscode.EventEmitter();
+    this.onDidChangeTreeData = this.emitter.event;
+    this.watcher = undefined;
+    this.watch();
+  }
+
+  watch() {
+    try {
+      fs.mkdirSync(dataDir(), { recursive: true });
+      this.watcher = fs.watch(dataDir(), (_e, file) => {
+        if (!file || /^(subjects|progress)\.json$/.test(String(file))) this.refresh();
+      });
+      // The folder can vanish and come back (iCloud): watch it again.
+      this.watcher.on("error", () => {
+        clearTimeout(this.rewatch);
+        this.rewatch = setTimeout(() => (this.watch(), this.refresh()), 2000);
+      });
+    } catch (e) {
+      log(`directory watch failed: ${e.message}`);
+    }
+  }
+
+  refresh() {
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => this.emitter.fire(), 300);
+  }
+
+  subjects() {
+    const reg = readJson(path.join(dataDir(), "subjects.json"), { subjects: {} });
+    return Object.values(reg.subjects || {})
+      .filter((s) => s && s.name)
+      .sort((a, b) => String(b.lastUsed || b.createdAt || "").localeCompare(String(a.lastUsed || a.createdAt || "")));
+  }
+
+  getChildren(node) {
+    if (node) {
+      const folders = (node.subject.folders || []).map((f) => ({ kind: "folder", subject: node.subject, folder: f }));
+      return [...folders, { kind: "addFolder", subject: node.subject }];
+    }
+    const due = {};
+    for (const [k, v] of Object.entries(this.controller.studyState().bySubject)) due[slug(k)] = (due[slug(k)] || 0) + v;
+    const subjects = this.subjects().map((s) => ({ kind: "subject", subject: s, due: due[slug(s.name)] || 0 }));
+    // With no subjects the welcome view (package.json) shows its own button.
+    return subjects.length ? [...subjects, { kind: "addSubject" }] : [];
+  }
+
+  getTreeItem(node) {
+    if (node.kind === "addSubject") {
+      const item = new vscode.TreeItem("Add class");
+      item.iconPath = new vscode.ThemeIcon("add");
+      item.tooltip = "Add a class or subject to study with TutorBot";
+      item.command = { command: "tutorbot.newSubject", title: "Add Class" };
+      return item;
+    }
+    const name = node.subject.name;
+    if (node.kind === "folder") {
+      const item = new vscode.TreeItem(path.basename(node.folder));
+      item.description = fs.existsSync(node.folder) ? "" : "missing";
+      item.tooltip = node.folder;
+      item.iconPath = new vscode.ThemeIcon("folder");
+      item.contextValue = "folder";
+      return item;
+    }
+    if (node.kind === "addFolder") {
+      const item = new vscode.TreeItem(node.subject.folders && node.subject.folders.length ? "Add another class folder…" : "Add class folder…");
+      item.iconPath = new vscode.ThemeIcon("new-folder");
+      item.tooltip = `TutorBot learns your teacher's question style from your ${name} class materials.`;
+      item.command = { command: "tutorbot.addSubjectFolder", title: "Add Class Folder", arguments: [node] };
+      return item;
+    }
+    const current = Boolean(this.controller.subject) && slug(this.controller.subject) === slug(name);
+    const item = new vscode.TreeItem(name, vscode.TreeItemCollapsibleState.Collapsed);
+    item.id = `subject:${slug(name)}`;
+    item.description = [current ? "current" : "", node.due ? `${node.due} due` : ""].filter(Boolean).join(" · ");
+    item.tooltip = new vscode.MarkdownString(
+      `**${name}**\n\n${node.due ? `${node.due} review${node.due === 1 ? "" : "s"} due\n\n` : ""}` +
+        ((node.subject.folders || []).length ? `Class folder: ${node.subject.folders.map((f) => path.basename(f)).join(", ")}\n\n` : "No class folder yet\n\n") +
+        "Click to chat about it",
+    );
+    item.iconPath = new vscode.ThemeIcon(current ? "book" : "circle-outline");
+    item.contextValue = "subject";
+    item.command = { command: "tutorbot.openSubject", title: "Open Chat", arguments: [node] };
+    return item;
+  }
+
+  dispose() {
+    clearTimeout(this.timer);
+    clearTimeout(this.rewatch);
+    if (this.watcher) this.watcher.close();
+    this.emitter.dispose();
   }
 }
 
@@ -1311,12 +1582,36 @@ function activate(context) {
   extensionRoot = context.extensionPath;
   context.subscriptions.push(output);
   controller = new Controller(context);
-  const provider = new ChatViewProvider(context, controller);
+  const chat = new ChatPanel(context, controller);
+  const directory = new SubjectDirectory(controller);
   const dashboard = new DashboardPanel(context, controller);
+  controller.chat = chat;
+  controller.directory = directory;
   controller.dashboard = dashboard;
+  // Directory commands get the tree node (click or menu), or nothing (palette).
+  const subjectArg = async (node, placeHolder) => {
+    if (node && node.subject) return node.subject.name;
+    const names = directory.subjects().map((s) => s.name);
+    if (!names.length) return void vscode.window.showInformationMessage("No subjects yet. Add one with TutorBot: New Subject.");
+    return vscode.window.showQuickPick(names, { placeHolder });
+  };
+  const withSubject = (placeHolder, fn) => async (node) => {
+    const name = await subjectArg(node, placeHolder);
+    if (name) return fn(name, node);
+  };
 
   context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider("tutorbot.chat", provider, { webviewOptions: { retainContextWhenHidden: true } }),
+    vscode.window.registerWebviewPanelSerializer("tutorbot.chat", { deserializeWebviewPanel: async (panel) => chat.setup(panel) }),
+    vscode.window.registerTreeDataProvider("tutorbot.directory", directory),
+    directory,
+    { dispose: () => chat.panel && chat.panel.dispose() },
+    vscode.commands.registerCommand("tutorbot.openSubject", withSubject("Open which subject?", (name) => controller.openSubject(name))),
+    vscode.commands.registerCommand("tutorbot.newSubject", () => controller.newSubject()),
+    vscode.commands.registerCommand("tutorbot.renameSubject", withSubject("Rename which subject?", (name) => controller.renameSubject(name))),
+    vscode.commands.registerCommand("tutorbot.removeSubject", withSubject("Remove which subject?", (name) => controller.removeSubject(name))),
+    vscode.commands.registerCommand("tutorbot.addSubjectFolder", withSubject("Add a class folder to which subject?", (name) => controller.addSubjectFolder(name))),
+    vscode.commands.registerCommand("tutorbot.removeSubjectFolder", (node) => node && node.folder && controller.removeSubjectFolder(node.subject.name, node.folder)),
+    vscode.commands.registerCommand("tutorbot.refreshSubjects", () => directory.refresh()),
     vscode.commands.registerCommand("tutorbot.focus", () => controller.reveal()),
     vscode.commands.registerCommand("tutorbot.launch", () => controller.reveal()),
     vscode.commands.registerCommand("tutorbot.newChat", () => controller.newChat()),

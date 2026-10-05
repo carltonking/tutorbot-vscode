@@ -443,6 +443,30 @@ export class TutorStore {
 		return moved;
 	}
 
+	// Forget a subject's progress: its concepts, quiz history, feedback, signals
+	// and exams. Returns how many concepts were removed.
+	deleteSubject(subject: string): number {
+		const data = this.loadProgress();
+		const f = slug(subject);
+		const removed: string[] = [];
+		for (const [id, c] of Object.entries(data.concepts)) {
+			if (slug(c.subject) !== f) continue;
+			delete data.concepts[id];
+			removed.push(id);
+		}
+		data.quizLog = data.quizLog.filter((q) => slug(q.subject) !== f);
+		if (data.lessonFeedback) data.lessonFeedback = data.lessonFeedback.filter((x) => slug(x.subject) !== f);
+		if (data.signals) data.signals = data.signals.filter((x) => !x.subject || slug(x.subject) !== f);
+		if (data.assessments) data.assessments = data.assessments.filter((x) => slug(x.subject) !== f);
+		this.saveProgress(data);
+		const links = this.loadLinks();
+		if (removed.some((id) => links[id])) {
+			for (const id of removed) delete links[id];
+			this.writeAtomic(join(this.dataDir, "topic-links.json"), JSON.stringify(links, null, 2));
+		}
+		return removed.length;
+	}
+
 	markTaught(subject: string, items: { name: string; summary?: string; family?: string; topic?: string }[], approach?: Approach): Concept[] {
 		const data = this.loadProgress();
 		const now = new Date().toISOString();

@@ -59,6 +59,24 @@ export class SubjectRegistry {
 		return r.subjects[s] ?? Object.values(r.subjects).find((x) => slug(x.name).startsWith(s) || s.startsWith(slug(x.name)));
 	}
 
+	// Exact match only (or a renamed subject's old name): find() also matches prefixes.
+	has(name: string): boolean {
+		const r = this.load();
+		return Boolean(r.subjects[this.canonicalKey(r, slug(name))]);
+	}
+
+	// Take a subject off the list. Its old names stop resolving to it.
+	remove(name: string): Subject | undefined {
+		const r = this.load();
+		const key = this.canonicalKey(r, slug(name));
+		const s = r.subjects[key];
+		if (!s) return undefined;
+		delete r.subjects[key];
+		for (const k of Object.keys(r.aliases ?? {})) if (r.aliases![k] === key) delete r.aliases![k];
+		this.save(r);
+		return s;
+	}
+
 	// A subject's current display name (a renamed subject's old name maps to the new one).
 	resolve(name: string): string {
 		const r = this.load();
