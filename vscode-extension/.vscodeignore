@@ -3,4 +3,4 @@ node_modules/**
 scripts/**
 package-lock.json
 demo/**
-images/**
+images/demo.*
