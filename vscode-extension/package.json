@@ -1,0 +1,261 @@
+{
+  "name": "tutorbot",
+  "displayName": "TutorBot",
+  "description": "TutorBot in VS Code: a Claude Code–style chat panel with typeset math, interactive quizzes, coding exercises checked as you type, and a progress dashboard.",
+  "version": "0.10.0",
+  "publisher": "carltonking",
+  "license": "UNLICENSED",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Education"
+  ],
+  "main": "./extension.js",
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "tutorbot.focus",
+        "title": "Open Chat",
+        "category": "TutorBot",
+        "icon": "$(mortar-board)"
+      },
+      {
+        "command": "tutorbot.dashboard",
+        "title": "Open Progress",
+        "category": "TutorBot",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "tutorbot.home",
+        "title": "Home (Switch Subject)",
+        "category": "TutorBot",
+        "icon": "$(home)"
+      },
+      {
+        "command": "tutorbot.newChat",
+        "title": "New Chat",
+        "category": "TutorBot",
+        "icon": "$(add)"
+      },
+      {
+        "command": "tutorbot.conversations",
+        "title": "Conversations",
+        "category": "TutorBot"
+      },
+      {
+        "command": "tutorbot.chooseModel",
+        "title": "Change Model",
+        "category": "TutorBot"
+      },
+      {
+        "command": "tutorbot.connectApiKey",
+        "title": "Connect API Key",
+        "category": "TutorBot",
+        "icon": "$(key)"
+      },
+      {
+        "command": "tutorbot.removeApiKey",
+        "title": "Remove API Key",
+        "category": "TutorBot"
+      },
+      {
+        "command": "tutorbot.restart",
+        "title": "Restart TutorBot",
+        "category": "TutorBot",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "tutorbot.showLog",
+        "title": "Show Log",
+        "category": "TutorBot"
+      },
+      {
+        "command": "tutorbot.submit",
+        "title": "Submit Exercise",
+        "category": "TutorBot",
+        "icon": "$(pass)"
+      },
+      {
+        "command": "tutorbot.hint",
+        "title": "Get a Hint",
+        "category": "TutorBot",
+        "icon": "$(lightbulb)"
+      },
+      {
+        "command": "tutorbot.ask",
+        "title": "Ask TutorBot About This Code",
+        "category": "TutorBot"
+      },
+      {
+        "command": "tutorbot.openExercise",
+        "title": "Open Current Exercise",
+        "category": "TutorBot"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "tutorbot.dashboard",
+          "when": "view == tutorbot.chat",
+          "group": "more@0"
+        },
+        {
+          "command": "tutorbot.newChat",
+          "when": "view == tutorbot.chat",
+          "group": "more@0"
+        },
+        {
+          "command": "tutorbot.conversations",
+          "when": "view == tutorbot.chat",
+          "group": "more@0"
+        },
+        {
+          "command": "tutorbot.chooseModel",
+          "when": "view == tutorbot.chat",
+          "group": "more@1"
+        },
+        {
+          "command": "tutorbot.connectApiKey",
+          "when": "view == tutorbot.chat",
+          "group": "more@1"
+        },
+        {
+          "command": "tutorbot.restart",
+          "when": "view == tutorbot.chat",
+          "group": "more@2"
+        },
+        {
+          "command": "tutorbot.showLog",
+          "when": "view == tutorbot.chat",
+          "group": "more@3"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "tutorbot.submit",
+          "when": "tutorbot.isExerciseFile",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tutorbot.hint",
+          "when": "tutorbot.isExerciseFile",
+          "group": "navigation@2"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "tutorbot.ask",
+          "when": "editorTextFocus",
+          "group": "tutorbot@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "tutorbot.submit",
+          "when": "tutorbot.hasExercise"
+        },
+        {
+          "command": "tutorbot.hint",
+          "when": "tutorbot.hasExercise"
+        },
+        {
+          "command": "tutorbot.openExercise",
+          "when": "tutorbot.hasExercise"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "tutorbot.focus",
+        "key": "ctrl+escape",
+        "mac": "cmd+escape"
+      },
+      {
+        "command": "tutorbot.ask",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "tutorbot.submit",
+        "key": "ctrl+alt+enter",
+        "mac": "cmd+alt+enter",
+        "when": "tutorbot.isExerciseFile"
+      },
+      {
+        "command": "tutorbot.hint",
+        "key": "ctrl+alt+h",
+        "mac": "cmd+alt+h",
+        "when": "tutorbot.isExerciseFile"
+      }
+    ],
+    "configuration": {
+      "title": "TutorBot",
+      "properties": {
+        "tutorbot.home": {
+          "type": "string",
+          "default": "",
+          "description": "Folder TutorBot keeps your notes, progress and exercises in. Empty = ~/TutorBot."
+        },
+        "tutorbot.liveCheckDelayMs": {
+          "type": "number",
+          "default": 800,
+          "minimum": 200,
+          "description": "Pause in typing (ms) before exercise tests re-run on your unsaved code."
+        },
+        "tutorbot.model": {
+          "type": "string",
+          "default": "",
+          "description": "Model as provider/id (e.g. anthropic/claude-sonnet-5-5). Empty = automatic: TutorBot picks one from the providers you've connected with TutorBot: Connect API Key."
+        },
+        "tutorbot.nodePath": {
+          "type": "string",
+          "default": "",
+          "description": "Advanced: Node.js to run TutorBot with. Empty = VS Code's built-in Node.js."
+        },
+        "tutorbot.piPath": {
+          "type": "string",
+          "default": "",
+          "description": "Advanced: path to a pi CLI (cli.js) to use instead of the one bundled with the extension."
+        },
+        "tutorbot.tutorPath": {
+          "type": "string",
+          "default": "",
+          "description": "Development: folder with TutorBot's extensions/ and skills/ to load instead of the bundled copy. Empty = bundled."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "tutorbot",
+          "title": "TutorBot",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "tutorbot": [
+        {
+          "type": "webview",
+          "id": "tutorbot.chat",
+          "name": "Chat",
+          "icon": "media/icon.svg"
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "ts-fsrs": "5.4.2"
+  },
+  "scripts": {
+    "build-runtime": "node scripts/build-runtime.mjs",
+    "vscode:prepublish": "npm run build-runtime"
+  }
+}

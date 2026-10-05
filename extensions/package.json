@@ -1,0 +1,8 @@
+{
+  "name": "tutorbot-extensions",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "ts-fsrs": "5.4.2"
+  }
+}

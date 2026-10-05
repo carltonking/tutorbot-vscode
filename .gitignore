@@ -1,0 +1,13 @@
+.DS_Store
+node_modules/
+.env
+.env.*
+__pycache__/
+*.pyc
+*.log
+.memory/
+
+# Local snapshots and build output
+backups/
+*.vsix
+vscode-extension/runtime/
