@@ -43,3 +43,7 @@ npm run package                  # runs scripts/build-runtime.mjs, then packages
 ```
 
 `scripts/build-runtime.mjs` assembles `runtime/`: pi with only its runtime dependencies, plus TutorBot's extensions (`../extensions`) and the teach skill (`../skills/teach`).
+
+## License
+
+MIT. See [LICENSE](LICENSE).

@@ -9,8 +9,7 @@
   },
   "version": "0.10.0",
   "publisher": "carltonking",
-  "license": "UNLICENSED",
-  "private": true,
+  "license": "MIT",
   "engines": {
     "vscode": "^1.90.0"
   },

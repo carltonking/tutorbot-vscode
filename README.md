@@ -66,3 +66,7 @@ For development, set `tutorbot.tutorPath` in VS Code to this repository so the e
 ## Credits
 
 The teaching approach was inspired by Amos Blomqvist's [learn](https://github.com/amosblomqvist/learn) system.
+
+## License
+
+MIT © 2026 Carlton King. See [LICENSE](LICENSE). Bundled third-party packages (including pi) keep their own licenses.
