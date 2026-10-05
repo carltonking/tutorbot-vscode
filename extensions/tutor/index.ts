@@ -1541,7 +1541,7 @@ ${resources}
 				const sub = registry.find(name) ?? registry.ensure(name);
 				const last = sub.lastSession && existsSync(sub.lastSession) ? sub.lastSession : undefined;
 				const due = store.dueConcepts(data, sub.name).length;
-				const CONTINUE = `Continue where I left off${sub.lastUsed ? ` (${sub.lastUsed.slice(0, 10)})` : ""}`;
+				const CONTINUE = "Continue where I left off";
 				const FRESH = "Start a fresh session (progress is kept)";
 				const REVIEW = `Review what's due (${due})`;
 				const FOLDER = sub.folders.length ? `Class folder: ${sub.folders.map((f) => basename(f)).join(", ")} (change)` : "Choose class folder…";
