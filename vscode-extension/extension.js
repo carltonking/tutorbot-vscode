@@ -71,6 +71,10 @@ function piCommand() {
   // -ne/-ns/-np: load only TutorBot, never the user's other pi extensions,
   // skills or prompts; --no-approve: ignore project-local .pi folders.
   const args = [piPath, "--mode", "rpc", "-ne", "-ns", "-np", "--no-approve"];
+  // A tutor reads and runs the learner's code but never rewrites it: pi's
+  // file-editing tools are off. (Exercise files are created by TutorBot's own
+  // assign_exercise tool, not by these.)
+  args.push("--exclude-tools", "edit,write");
   for (const e of TUTOR_EXTENSIONS) args.push("-e", path.join(tutor, "extensions", e));
   for (const k of TUTOR_SKILLS) args.push("--skill", path.join(tutor, "skills", k));
   // VS Code's binary runs as plain Node.js with ELECTRON_RUN_AS_NODE.
@@ -933,6 +937,27 @@ class Controller {
     this.bridge.post("hint", { question: question.trim() || undefined }).catch((e) => vscode.window.showErrorMessage(e.message));
   }
 
+  // "Check This File": the learner's own program becomes an exercise with
+  // tests that re-run as they type. TutorBot reads and runs it but can't edit it.
+  async checkFile(uri) {
+    const doc = uri && uri.fsPath ? await vscode.workspace.openTextDocument(uri) : vscode.window.activeTextEditor && vscode.window.activeTextEditor.document;
+    if (!doc) return vscode.window.showInformationMessage("Open a Python, Java or JavaScript file first.");
+    if (!CHECKABLE.has(doc.languageId)) return vscode.window.showInformationMessage("TutorBot can check Python, Java and JavaScript files.");
+    if (doc.isUntitled) return vscode.window.showInformationMessage("Save the file first, then check it.");
+    if (doc.isDirty) await doc.save();
+    if (this.exercise && samePath(this.exercise.file, doc.uri.fsPath)) return this.submit();
+    this.reveal();
+    await this.ensureStarted();
+    const rel = vscode.workspace.asRelativePath(doc.uri);
+    this.onWebview({
+      type: "send",
+      text:
+        `Check my code in \`${rel}\` (${doc.uri.fsPath}). Read and run it, then tell me what works and what doesn't. ` +
+        `Then turn it into an exercise (assign_exercise with existingFile) so it's tested as I type; ask me what it should do first if that isn't clear from the code. ` +
+        `Don't rewrite it for me.`,
+    });
+  }
+
   async askAboutSelection() {
     const ed = vscode.window.activeTextEditor;
     if (!ed) return;
@@ -963,6 +988,8 @@ class Controller {
     if (this.proc) this.proc.stop();
   }
 }
+
+const CHECKABLE = new Set(["python", "java", "javascript"]);
 
 function samePath(a, b) {
   return path.resolve(a) === path.resolve(b);
@@ -1308,6 +1335,7 @@ function activate(context) {
     vscode.commands.registerCommand("tutorbot.submit", () => controller.submit()),
     vscode.commands.registerCommand("tutorbot.hint", () => controller.hint()),
     vscode.commands.registerCommand("tutorbot.ask", () => controller.askAboutSelection()),
+    vscode.commands.registerCommand("tutorbot.checkFile", (uri) => controller.checkFile(uri)),
     vscode.commands.registerCommand("tutorbot.openExercise", () => controller.exercise && controller.openFile(controller.exercise.file)),
     vscode.commands.registerCommand("tutorbot.showLog", () => output.show(true)),
     vscode.commands.registerCommand("tutorbot.dashboard", () => dashboard.open()),

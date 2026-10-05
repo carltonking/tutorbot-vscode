@@ -18,6 +18,7 @@ Nothing else to install: the extension bundles its AI engine ([pi](https://githu
 - **Teaches from where you are.** Short diagnostic questions find what you already know; lessons build one idea at a time from there, in your course's notation and order.
 - **Graded quizzes in the chat.** Multiple choice (with an honest "I don't know") and typed answers. Answer keys for code output and math are verified by actually running code before a question is shown.
 - **Coding exercises.** TutorBot writes a small program to build, with tests. The file opens in the editor, tests re-run as you type, and compile errors show as squiggles. Submit with ⌘⌥↵, ask for a hint with ⌘⌥H.
+- **Checks your own code.** Write a program yourself and use *Check This File*: TutorBot runs it, explains what's wrong, and adds tests so your file is tested as you type. It can read and run your files but never edits them.
 - **Progress dashboard.** Per concept: how well you'd recall it today, and how you've proven it (with help, on your own, in a checkpoint), across the whole course map.
 
 ## Learning features (evidence-based)

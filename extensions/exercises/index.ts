@@ -1,8 +1,8 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { existsSync, type FSWatcher, mkdirSync, readFileSync, watch, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { existsSync, type FSWatcher, mkdirSync, readFileSync, statSync, watch, writeFileSync } from "node:fs";
+import { basename, extname, isAbsolute, join } from "node:path";
 import { getBridge } from "../lib/bridge.ts";
 import { coerceJsonArgs } from "../lib/coerce.ts";
 import { type Language, normalizeOutput, runCode, type RunResult } from "../lib/run-code.ts";
@@ -64,6 +64,18 @@ interface CheckStatus {
 }
 
 const FILE_NAME: Record<Language, string> = { java: "Main.java", python: "main.py", javascript: "main.js" };
+const LANGUAGE_OF_EXT: Record<string, Language> = { ".java": "java", ".py": "python", ".js": "javascript", ".mjs": "javascript", ".cjs": "javascript" };
+
+// A learner's own file to turn into an exercise: it must exist and be a
+// program in the exercise's language. Returns an error message, or undefined.
+function checkExistingFile(file: string, language: Language): string | undefined {
+	if (!isAbsolute(file)) return `existingFile must be an absolute path (got "${file}").`;
+	if (!existsSync(file) || !statSync(file).isFile()) return `existingFile ${file} doesn't exist.`;
+	const lang = LANGUAGE_OF_EXT[extname(file).toLowerCase()];
+	if (!lang) return `existingFile ${basename(file)} isn't a Java, Python or JavaScript file.`;
+	if (lang !== language) return `existingFile ${basename(file)} is ${lang}, but language is ${language}.`;
+	return undefined;
+}
 const COMMENT: Record<Language, [string, string, string]> = {
 	java: ["/*", " * ", " */"],
 	javascript: ["/*", " * ", " */"],
@@ -493,6 +505,7 @@ Latest results: ${lastText}
 			"assign_exercise: use it after a programming concept has been taught and quiz-checked, so the learner applies it by writing real code. Keep exercises small (one new idea at a time, 5–25 lines) and build up.",
 			"assign_exercise: the prompt must state exactly what to read (input) and print (output) with one worked example. Provide 3–6 tests covering normal cases and an edge case; mark 1–2 as hidden so they can't hard-code answers.",
 			"assign_exercise: in the TutorBot panel the exercise is an interactive card: the tool waits while the learner writes code and presses Check, and returns when they pass every test, give up (the reference solution is shown), ask for help, or skip — with their code and test results. Don't write anything while it waits, and never paste a solution.",
+			"assign_exercise: when the learner asks you to check a program they wrote themselves, pass its absolute path as `existingFile` (and no starterCode). Their file becomes the exercise: it is never changed, and it gets tests that re-run as they type. First make sure you know what the program should do — from its comments, or ask with ask_user_question — then write the prompt, tests and referenceSolution for that goal. Tests feed stdin and compare stdout, so they suit programs that read input and print output; if theirs doesn't print anything yet, say what to add rather than testing it.",
 			"assign_exercise: pass a 1-3 step `hints` ladder (guiding question → technique → first concrete step, never code that solves it) and an `explanation` of the approach, shown after they solve it or give up.",
 		],
 		prepareArguments: (args: any) => coerceJsonArgs(args, ["concepts", "tests", "hints"]),
@@ -502,9 +515,16 @@ Latest results: ${lastText}
 			title: Type.String({ description: "Short title, e.g. 'Sum of digits'." }),
 			language: Type.Union([Type.Literal("java"), Type.Literal("python"), Type.Literal("javascript")]),
 			prompt: Type.String({ description: "The problem statement in markdown (input format, output format, one worked example). LaTeX allowed." }),
-			starterCode: Type.String({
-				description: "Starter file content. Java: must contain `public class Main` with main(); leave TODO comments where they write code. Don't include the solution.",
-			}),
+			starterCode: Type.Optional(
+				Type.String({
+					description: "Starter file content (required unless existingFile is given). Java: must contain `public class Main` with main(); leave TODO comments where they write code. Don't include the solution.",
+				}),
+			),
+			existingFile: Type.Optional(
+				Type.String({
+					description: "Absolute path of a program the learner wrote themselves, to turn into this exercise instead of creating a starter file. The file is never modified.",
+				}),
+			),
 			tests: Type.Array(
 				Type.Object({
 					name: Type.String({ description: "What the test checks, e.g. 'three-digit number'." }),
@@ -528,6 +548,12 @@ Latest results: ${lastText}
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			ctxRef = ctx;
 			const language = params.language as Language;
+			const refuse = (text: string) => ({ content: [{ type: "text" as const, text: `Exercise NOT assigned: ${text}` }], details: { assigned: false } });
+			const existing = params.existingFile?.trim();
+			if (existing) {
+				const problem = checkExistingFile(existing, language);
+				if (problem) return refuse(problem);
+			} else if (!params.starterCode?.trim()) return refuse("starterCode is required (or existingFile, to use a program the learner already wrote).");
 			onUpdate?.({ content: [{ type: "text", text: "Checking the reference solution against the tests…" }] });
 			const ref = await runTests(language, params.referenceSolution, params.tests);
 			if (ref.compileError || ref.passed !== ref.total) {
@@ -543,21 +569,27 @@ Latest results: ${lastText}
 					details: { assigned: false },
 				};
 			}
-			const subjectDir = params.subject.replace(/[/\\:]/g, "-").trim();
-			const base = join(ctx.cwd, "Exercises", subjectDir);
-			mkdirSync(base, { recursive: true });
-			let n = 1;
-			let dir: string;
-			do {
-				dir = join(base, `${String(n).padStart(2, "0")}-${slug(params.title).slice(0, 40)}`);
-				n++;
-			} while (existsSync(dir));
-			mkdirSync(dir, { recursive: true });
-			const file = join(dir, FILE_NAME[language]);
-			const [open, mid, close] = COMMENT[language];
-			const header = [open, `${mid}TutorBot exercise: ${params.title}`, `${mid}`, ...params.prompt.split("\n").map((l) => `${mid}${l}`.trimEnd()), close, ""].join("\n");
-			writeFileSync(file, `${header}\n${params.starterCode.trimEnd()}\n`);
-			writeFileSync(join(dir, "README.md"), `# ${params.title}\n\n${params.prompt}\n`);
+			let file: string;
+			if (existing) {
+				// The learner's own program is the exercise; it's only ever read.
+				file = existing;
+			} else {
+				const subjectDir = params.subject.replace(/[/\\:]/g, "-").trim();
+				const base = join(ctx.cwd, "Exercises", subjectDir);
+				mkdirSync(base, { recursive: true });
+				let n = 1;
+				let dir: string;
+				do {
+					dir = join(base, `${String(n).padStart(2, "0")}-${slug(params.title).slice(0, 40)}`);
+					n++;
+				} while (existsSync(dir));
+				mkdirSync(dir, { recursive: true });
+				file = join(dir, FILE_NAME[language]);
+				const [open, mid, close] = COMMENT[language];
+				const header = [open, `${mid}TutorBot exercise: ${params.title}`, `${mid}`, ...params.prompt.split("\n").map((l) => `${mid}${l}`.trimEnd()), close, ""].join("\n");
+				writeFileSync(file, `${header}\n${params.starterCode!.trimEnd()}\n`);
+				writeFileSync(join(dir, "README.md"), `# ${params.title}\n\n${params.prompt}\n`);
+			}
 
 			const ex: Exercise = {
 				id: `${Date.now().toString(36)}-${slug(params.title).slice(0, 30)}`,

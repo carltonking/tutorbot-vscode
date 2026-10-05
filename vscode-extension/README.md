@@ -27,6 +27,8 @@ A key already set in your shell environment (e.g. `ANTHROPIC_API_KEY`) also work
 - **Progress**: the chart button in the header (or *TutorBot: Open Progress*) opens a dashboard tab. It shows memory (fades between reviews) and proof level for every concept, across the whole course map, with upcoming exams as coverage plus an at-risk list. Buttons there (Teach me, Check, Practice, Checkpoint) run in the chat. It reads TutorBot's files directly, so it works without TutorBot running and updates live.
 - **Coding exercises**: the file opens in the editor and the tests re-run as you type. Errors show as squiggles. Use Submit (⌘⌥↵) and Hint (⌘⌥H).
 - **Ask about code**: select code, then ⌘⌥K or right-click → *Ask TutorBot About This Code*.
+- **Check your own code**: in any Python, Java or JavaScript file you wrote, click the beaker in the editor title bar (or right-click → *TutorBot: Check This File*). TutorBot reads and runs it, tells you what works and what doesn't, then writes tests for what it should do, so your file is tested as you type, just like an exercise.
+- **Your code stays yours**: TutorBot can read and run your files but can't edit them. It explains and hints; it doesn't rewrite your code.
 
 Settings: `tutorbot.model` (empty = automatic, or `provider/model`, e.g. `anthropic/claude-sonnet-5-5`), `tutorbot.home`. For development, `tutorbot.tutorPath` loads TutorBot's extensions and skills from a working copy instead of the bundled one.
 

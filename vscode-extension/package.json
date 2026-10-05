@@ -7,7 +7,7 @@
     "url": "https://github.com/carltonking/tutorbot-vscode.git",
     "directory": "vscode-extension"
   },
-  "version": "0.10.0",
+  "version": "0.11.0",
   "publisher": "carltonking",
   "license": "MIT",
   "engines": {
@@ -96,6 +96,12 @@
         "category": "TutorBot"
       },
       {
+        "command": "tutorbot.checkFile",
+        "title": "Check This File",
+        "category": "TutorBot",
+        "icon": "$(beaker)"
+      },
+      {
         "command": "tutorbot.openExercise",
         "title": "Open Current Exercise",
         "category": "TutorBot"
@@ -149,6 +155,11 @@
           "command": "tutorbot.hint",
           "when": "tutorbot.isExerciseFile",
           "group": "navigation@2"
+        },
+        {
+          "command": "tutorbot.checkFile",
+          "when": "resourceLangId =~ /^(python|java|javascript)$/ && !tutorbot.isExerciseFile",
+          "group": "navigation@3"
         }
       ],
       "editor/context": [
@@ -156,6 +167,11 @@
           "command": "tutorbot.ask",
           "when": "editorTextFocus",
           "group": "tutorbot@1"
+        },
+        {
+          "command": "tutorbot.checkFile",
+          "when": "resourceLangId =~ /^(python|java|javascript)$/ && !tutorbot.isExerciseFile",
+          "group": "tutorbot@2"
         }
       ],
       "commandPalette": [
@@ -170,6 +186,17 @@
         {
           "command": "tutorbot.openExercise",
           "when": "tutorbot.hasExercise"
+        },
+        {
+          "command": "tutorbot.checkFile",
+          "when": "editorLangId =~ /^(python|java|javascript)$/"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "tutorbot.checkFile",
+          "when": "resourceLangId =~ /^(python|java|javascript)$/",
+          "group": "tutorbot@1"
         }
       ]
     },
