@@ -629,13 +629,23 @@ class Controller {
     if (event === "diagnostics") return this.setDiagnostics(data.file, data.diagnostics || []);
   }
 
+  // Clean mode: hide thinking and tool steps. hide = undefined flips it.
+  async toggleWorking(hide) {
+    if (typeof hide !== "boolean") hide = cfg("hideWorking") === false;
+    await vscode.workspace.getConfiguration("tutorbot").update("hideWorking", hide, vscode.ConfigurationTarget.Global);
+    this.post({ type: "notice", level: "info", text: hide ? "Clean mode on: thinking and tool steps are hidden." : "Clean mode off: thinking and tool steps are shown." });
+  }
+
   // ---- messages from the chat view
   async onWebview(m) {
     switch (m.type) {
+      case "toggleWorking":
+        return this.toggleWorking(m.value);
       case "ready":
         this.webviewReady = true;
         this.post({ type: "theme", kind: vscode.window.activeColorTheme.kind });
         this.post({ type: "model", model: this.model || String(cfg("model") || "") });
+        this.post({ type: "hideWorking", value: cfg("hideWorking") !== false });
         this.flush();
         if (this.proc && this.proc.running) {
           this.post({ type: "connection", state: "running" });
@@ -1528,6 +1538,7 @@ class ChatPanel {
 <script nonce="${nonce}" src="${uri("vendor/katex.min.js")}"></script>
 <script nonce="${nonce}" src="${uri("vendor/markdown-it.min.js")}"></script>
 <script nonce="${nonce}" src="${uri("vendor/highlight.min.js")}"></script>
+<script nonce="${nonce}" src="${uri("plainmath.js")}"></script>
 <script nonce="${nonce}" src="${uri("chat.js")}"></script>
 </body></html>`;
     panel.onDidDispose(() => {
@@ -1702,6 +1713,10 @@ function activate(context) {
     vscode.commands.registerCommand("tutorbot.openExercise", () => controller.exercise && controller.openFile(controller.exercise.file)),
     vscode.commands.registerCommand("tutorbot.showLog", () => output.show(true)),
     vscode.commands.registerCommand("tutorbot.dashboard", () => dashboard.open()),
+    vscode.commands.registerCommand("tutorbot.toggleWorking", () => controller.toggleWorking()),
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("tutorbot.hideWorking")) controller.post({ type: "hideWorking", value: cfg("hideWorking") !== false });
+    }),
     { dispose: () => dashboard.panel && dashboard.panel.dispose() },
     vscode.window.onDidChangeActiveColorTheme((t) => dashboard.panel && dashboard.panel.webview.postMessage({ type: "theme", kind: t.kind })),
     vscode.workspace.onDidChangeTextDocument((e) => controller.onType(e)),

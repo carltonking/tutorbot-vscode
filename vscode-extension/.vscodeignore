@@ -4,3 +4,4 @@ scripts/**
 package-lock.json
 demo/**
 images/demo.*
+test/**

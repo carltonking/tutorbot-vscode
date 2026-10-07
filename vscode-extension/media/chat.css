@@ -105,6 +105,11 @@ button { font: inherit; color: inherit; }
 .transcript { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 10px 14px 6px; }
 .item { margin: 0 0 10px; }
 .item:last-child { margin-bottom: 4px; }
+body.hide-working .item.working { display: none; }
+body.hide-working .item.rate-only .tool > :not(.rate) { display: none; }
+.notice .short { display: none; }
+body.hide-working .notice .full { display: none; }
+body.hide-working .notice .short { display: inline; }
 
 .user {
   overflow-wrap: anywhere;

@@ -8,7 +8,7 @@
     "url": "https://github.com/carltonking/tutorbot-vscode.git",
     "directory": "vscode-extension"
   },
-  "version": "0.12.3",
+  "version": "0.12.8",
   "publisher": "CarltonKing",
   "license": "MIT",
   "engines": {
@@ -79,6 +79,12 @@
         "command": "tutorbot.showLog",
         "title": "Show Log",
         "category": "TutorBot"
+      },
+      {
+        "command": "tutorbot.toggleWorking",
+        "title": "Toggle Clean Mode (Hide Thinking & Tool Steps)",
+        "category": "TutorBot",
+        "icon": "$(eye-closed)"
       },
       {
         "command": "tutorbot.submit",
@@ -244,6 +250,11 @@
           "command": "tutorbot.restart",
           "when": "activeWebviewPanelId == tutorbot.chat",
           "group": "1_tutorbot@3"
+        },
+        {
+          "command": "tutorbot.toggleWorking",
+          "when": "activeWebviewPanelId == tutorbot.chat",
+          "group": "1_tutorbot@4"
         }
       ],
       "editor/context": [
@@ -358,6 +369,11 @@
     "configuration": {
       "title": "TutorBot",
       "properties": {
+        "tutorbot.hideWorking": {
+          "type": "boolean",
+          "default": true,
+          "description": "Hide TutorBot's thinking and the tool steps it runs, so the chat shows only its replies, quizzes and exercises."
+        },
         "tutorbot.home": {
           "type": "string",
           "default": "",
@@ -424,6 +440,7 @@
   },
   "scripts": {
     "build-runtime": "node scripts/build-runtime.mjs",
+    "test": "node --test test/*.test.mjs",
     "vscode:prepublish": "npm run build-runtime",
     "package": "vsce package --baseImagesUrl https://github.com/carltonking/tutorbot-vscode/raw/HEAD/vscode-extension --baseContentUrl https://github.com/carltonking/tutorbot-vscode/blob/HEAD/vscode-extension"
   },

@@ -35,6 +35,9 @@
   const SPIN = '<span class="spinner" aria-hidden="true"></span>';
   const VERBS = ["Thinking", "Pondering", "Working it out", "Preparing", "Connecting ideas", "Tutoring"];
   const MAX_ITEMS = 600;
+  const SHORT_MODEL_ERROR = "Couldn't get a reply. The AI provider may be busy; send your message again in a moment.";
+  // Handled by the chat itself, never sent to pi.
+  const LOCAL_COMMANDS = [{ name: "cleanmode", description: "Turn clean mode on or off (hide thinking and tool steps)", source: "local" }];
 
   // ── state ──────────────────────────────────────────────────────────────
   const S = {
@@ -66,6 +69,7 @@
     // Conversations view. editing: { kind: "subject" | "session", key, original }
     convos: { open: false, data: null, loadError: "", error: "", editing: null },
     stuck: true, // follow new output unless the learner scrolled up
+    hideWorking: true, // hide thinking and tool rows; only answers and cards show
   };
   const nextId = (p) => `${p}${++S.seq}`;
 
@@ -117,8 +121,8 @@
 
   function renderRich(text, inline) {
     const math = [];
-    const src = repairMath(String(text ?? ""))
-      .replace(/[]/g, "")
+    const src = texifyOutside(repairMath(String(text ?? ""))
+      .replace(/[]/g, ""))
       .replace(SEGMENT, (m, code, dd, db, ip, id) => {
         if (code) return m;
         const display = dd !== undefined || db !== undefined;
@@ -135,6 +139,21 @@
     return html.replace(/(\d+)/g, (_, i) => math[Number(i)] ?? "");
   }
 
+  // Plain-text math ("-sqrt(9-x^2)/x") outside code and $…$ spans becomes $…$,
+  // so math is typeset even when the model forgot the delimiters.
+  const texifyOutside = (src) => PlainMath.texifyOutside(src, SEGMENT);
+
+  // An answer or answer key: one expression, typeset. Graded answers are plain
+  // text ("-cscxcotx+c", "-sqrt(9-x^2)/x - asin(x/3)"); LaTeX keys pass through.
+  // Anything that isn't math (code, words) falls back to `fallback`.
+  function answerHtml(s, fallback = "code") {
+    const raw = String(s ?? "").trim();
+    const a = PlainMath.answerTex(raw);
+    if (a.kind === "tex") return `<span class="answer-math" title="${esc(raw)}">${katex.renderToString(a.tex, { throwOnError: false, output: "html" })}</span>`;
+    if (a.kind === "rich" || fallback !== "code") return renderRich(raw, true);
+    return `<code>${esc(raw)}</code>`;
+  }
+
   // ── tool presentation ──────────────────────────────────────────────────
   const base = (p) => String(p || "").split("/").pop();
   const first = (s, n = 80) => {
@@ -143,7 +162,7 @@
   };
   // [row title, arg summary, spinner verb]
   const TOOLS = {
-    rate_explanation: ["Rated your explanation", (a) => a.quality, "Reviewing your explanation"],
+    rate_explanation: ["Rated your explanation", (a) => ({ good: "solid", partial: "on the right track", missing: "no reasoning yet" })[a.quality] || a.quality, "Reviewing your explanation"],
     course_style_sources: ["Read your class assessments", (a) => a.subject, "Studying how your teacher asks questions"],
     save_course_style: ["Saved course style", (a) => a.subject, "Saving the course style"],
     teacher_examples: ["Teacher's questions", (a) => `"${a.topic}"`, "Finding your teacher's questions"],
@@ -334,6 +353,7 @@
       restore = { key, start: active.selectionStart, end: active.selectionEnd };
     }
     paint(node, item);
+    node.classList.toggle("working", isWorking(node, item));
     if (restore) {
       const el = restore.key ? node.querySelector(`[${restore.key}]`) : null;
       if (el) {
@@ -343,6 +363,18 @@
         } catch {}
       } else node.querySelector(".card")?.focus({ preventScroll: true });
     }
+  }
+
+  // Behind-the-scenes steps the learner can hide: thinking, agent notices
+  // (retries, compaction, extension errors), and plain tool rows (not cards).
+  // A tool row still asking for a rating keeps just its rating buttons.
+  function isWorking(node, item) {
+    if (item.kind === "thinking") return true;
+    if (item.kind === "notice") return Boolean(item.internal);
+    if (item.kind !== "tool" || !node.querySelector(":scope > .tool")) return false;
+    const rate = node.querySelector(".rate");
+    node.classList.toggle("rate-only", Boolean(rate) && !rate.classList.contains("done"));
+    return !node.classList.contains("rate-only");
   }
 
   function paint(node, item) {
@@ -371,7 +403,8 @@
         return CARD_TOOLS.has(item.name) ? paintCardTool(node, item) : paintToolRow(node, item);
       case "notice": {
         const glyph = item.level === "error" ? "✗" : item.level === "warning" ? "!" : "⎿";
-        node.innerHTML = `<div class="notice ${esc(item.level)}"><span class="glyph">${glyph}</span><span>${renderRich(item.text, true)}</span></div>`;
+        const body = item.short ? `<span class="full">${renderRich(item.text, true)}</span><span class="short">${esc(item.short)}</span>` : `<span>${renderRich(item.text, true)}</span>`;
+        node.innerHTML = `<div class="notice ${esc(item.level)}"><span class="glyph">${glyph}</span>${body}</div>`;
         return;
       }
       case "dialog":
@@ -465,7 +498,7 @@
   function explainBlock(ex) {
     const head = ex.correct
       ? `<div class="verdict good">Correct, but you said it was a guess.</div><div class="eb-prompt">Before the explanation: in your own words, why is it right?</div>`
-      : `<div class="verdict bad">Not quite. The correct answer is ${renderRich(ex.correctAnswer || "", true)}.</div><div class="eb-prompt">Before the explanation: in your own words, why is that the answer, or where did your reasoning go wrong?</div>`;
+      : `<div class="verdict bad">Not quite. The correct answer is ${answerHtml(ex.correctAnswer, "rich")}.</div><div class="eb-prompt">Before the explanation: in your own words, why is that the answer, or where did your reasoning go wrong?</div>`;
     return `<div class="explain-back">${head}<textarea rows="2" data-explain placeholder="Explain in your own words…">${esc(ex.draft || "")}</textarea><div class="actions"><button class="btn small" data-act="eb-submit">Submit</button><button class="btn small secondary" data-act="eb-direct">Just show me</button><button class="link-btn" data-act="eb-skip">Skip</button>${keyHint(["Enter submits", "Esc skips"])}</div></div>`;
   }
   function answerMeta(d) {
@@ -547,10 +580,11 @@
   }
 
   function typedResult(r, withButtons) {
-    let h = `<div class="answer-line">Your answer: <code>${esc(r.dontKnow ? "(I don't know)" : r.answer || "(empty)")}</code></div>`;
+    let h = `<div class="answer-line">Your answer: ${r.dontKnow ? "<code>(I don't know)</code>" : r.answer ? answerHtml(r.answer) : "<code>(empty)</code>"}</div>`;
     const v = r.dontKnow ? ["warn", "You said: I don't know"] : r.correct ? ["good", "Correct"] : r.disputed ? ["warn", "Disputed — TutorBot will judge it"] : ["bad", "Not a match"];
-    h += `<div class="verdict ${v[0]}">${v[1]}</div>`;
-    if (!r.correct) h += `<div class="answer-line">Expected: <code>${esc(r.expected)}</code></div>`;
+    h += `<div class="verdict ${v[0]}">${v[1]}${r.correct && r.attempts > 1 ? ` on try ${r.attempts}` : ""}</div>`;
+    if (r.earlierTries && r.earlierTries.length) h += `<div class="meta-line">Earlier tries: ${r.earlierTries.map((t) => answerHtml(t)).join(" · ")}</div>`;
+    if (!r.correct) h += `<div class="answer-line">Expected: ${answerHtml(r.expected)}</div>`;
     h += answerMeta(r);
     if (r.explanation) h += `<div class="explain text">${renderRich(r.explanation)}</div>`;
     if (withButtons) {
@@ -569,14 +603,21 @@
     const live = !answered && Boolean((ask && !ask.done) || (fb && !fb.done) || (ex && !ex.done));
     let html = `<div class="card${live ? " live" : ""}" tabindex="-1">${cardHead("Type your answer", a.purpose, live)}<div class="q">${renderRich(a.question)}</div>`;
     if (a.details) html += `<div class="q ctx">${renderRich(a.details)}</div>`;
-    const yours = (txt) => `<div class="answer-line">Your answer: <code>${esc(txt || "")}</code></div>`;
+    const yours = (txt) => `<div class="answer-line">Your answer: ${txt ? answerHtml(txt) : "<code></code>"}</div>`;
     if (answered) html += typedResult(d, false);
     else if (fb && !fb.done) html += typedResult(fb, true);
     else if (fb) html += `${typedResult(fb, false)}<div class="pending-line">${SPIN}Saving…</div>`;
     else if (ex && !ex.done) html += yours(ask && ask.draft) + explainBlock(ex);
     else if (ex) html += yours(ask && ask.draft) + `<div class="pending-line">${SPIN}Revealing the explanation…</div>`;
     else if (stage === "confidence") html += yours(ask.draft) + confidenceBlock();
-    else if (ask && !ask.done) {
+    else if (ask && !ask.done && ask.retry) {
+      const left = ask.retry.of - ask.retry.attempt + 1;
+      html += `<div class="verdict bad">Not quite: ${answerHtml(ask.retry.previous)}</div>`;
+      html += `<div class="meta-line">Try again: fix your answer below${hintButton(ask) ? ", or take a hint" : ""}. ${left === 1 ? "Last try." : `${left} tries left.`}</div>`;
+      html += hintsBlock(ask);
+      html += `<textarea class="mono" rows="2" data-typed placeholder="Type your answer…">${esc(ask.draft || "")}</textarea>`;
+      html += `<div class="actions"><button class="btn small" data-act="typed-submit">Check again</button>${hintButton(ask)}<button class="link-btn" data-act="typed-reveal">Show answer</button>${keyHint(["Enter submits", "⇧Enter newline", "Esc skips"])}</div>`;
+    } else if (ask && !ask.done) {
       html += hintsBlock(ask);
       html += `<textarea class="mono" rows="2" data-typed placeholder="Type your answer…">${esc(ask.draft || "")}</textarea>`;
       html += `<div class="actions"><button class="btn small" data-act="typed-submit">Submit</button><button class="btn small secondary" data-act="typed-dontknow">I don't know</button>${hintButton(ask)}${keyHint(["Enter submits", "⇧Enter newline", "Esc skips"])}</div>`;
@@ -948,7 +989,7 @@
             scheduleRender(it.id);
           } else if (b.type === "toolCall") scheduleRender(toolItem(b.id, b.name, b.arguments).id);
         });
-        if (m.stopReason === "error" && m.errorMessage) addItem({ id: nextId("n"), kind: "notice", level: "error", text: m.errorMessage });
+        if (m.stopReason === "error" && m.errorMessage) addItem({ id: nextId("n"), kind: "notice", level: "error", text: m.errorMessage, short: SHORT_MODEL_ERROR });
         if (m.stopReason === "aborted") addItem({ id: nextId("n"), kind: "notice", level: "info", text: "Interrupted by user" });
         S.curMsg = null;
         break;
@@ -986,13 +1027,13 @@
         renderQueueStrip();
         break;
       case "auto_retry_start":
-        addItem({ id: nextId("n"), kind: "notice", level: "warning", text: `Retrying (${ev.attempt || ""}${ev.maxAttempts ? `/${ev.maxAttempts}` : ""})${ev.errorMessage ? `: ${first(ev.errorMessage, 120)}` : ""}` });
+        addItem({ id: nextId("n"), kind: "notice", level: "warning", internal: true, text: `Retrying (${ev.attempt || ""}${ev.maxAttempts ? `/${ev.maxAttempts}` : ""})${ev.errorMessage ? `: ${first(ev.errorMessage, 120)}` : ""}` });
         break;
       case "compaction_start":
-        addItem({ id: nextId("n"), kind: "notice", level: "info", text: "Compacting the conversation…" });
+        addItem({ id: nextId("n"), kind: "notice", level: "info", internal: true, text: "Compacting the conversation…" });
         break;
       case "extension_error":
-        addItem({ id: nextId("n"), kind: "notice", level: "error", text: `Extension error (${base(ev.extensionPath)}): ${first(ev.error, 200)}` });
+        addItem({ id: nextId("n"), kind: "notice", level: "error", internal: true, text: `Extension error (${base(ev.extensionPath)}): ${first(ev.error, 200)}` });
         break;
       default:
         break;
@@ -1027,7 +1068,7 @@
           else if (b.type === "thinking" && b.thinking && b.thinking.trim()) addItem({ id: `${key}:${ci}`, kind: "thinking", text: b.thinking });
           else if (b.type === "toolCall") tools.set(b.id, addItem({ id: b.id, callId: b.id, kind: "tool", name: b.name, args: b.arguments || {}, status: "running", fromHistory: true }));
         });
-        if (m.stopReason === "error" && m.errorMessage) addItem({ id: nextId("n"), kind: "notice", level: "error", text: m.errorMessage });
+        if (m.stopReason === "error" && m.errorMessage) addItem({ id: nextId("n"), kind: "notice", level: "error", text: m.errorMessage, short: SHORT_MODEL_ERROR });
       } else if (m.role === "toolResult") {
         const it = tools.get(m.toolCallId);
         if (it) {
@@ -1071,6 +1112,9 @@
 
   function onAsk(raw) {
     const ask = { ...raw, focus: 0, done: false };
+    // A typed answer that missed comes back for another try: keep the
+    // learner's answer to edit and the hints they already opened.
+    if (ask.retry) Object.assign(ask, { draft: ask.retry.previous || "", hintsShown: ask.retry.hintsShown || 0 });
     // Explain-it-back: either the second step of a quiz/typed card, or the
     // standalone explain_back tool. Either way it lives in item.explain.
     if (ask.kind === "explain_back" || ask.kind === "explain") {
@@ -1410,7 +1454,7 @@
     }
     const secs = Math.floor((Date.now() - S.runStart) / 1000);
     const tokens = S.runTokens + S.msgTokens;
-    const verb = S.activity || S.verb;
+    const verb = (!S.hideWorking && S.activity) || S.verb;
     // Update text in place so the CSS spinner keeps animating smoothly.
     if (!el.querySelector(".spinner")) el.innerHTML = `${SPIN}<span class="verb"></span><span class="meta"></span>`;
     el.querySelector(".verb").textContent = `${verb}…`;
@@ -1448,6 +1492,12 @@
     autosize();
     closeSlash();
     updateSendButton();
+    const clean = text.match(/^\/cleanmode(?:\s+(on|off))?$/i);
+    if (clean) {
+      addItem({ id: nextId("c"), kind: "command", text });
+      vscode.postMessage({ type: "toggleWorking", value: clean[1] ? clean[1].toLowerCase() === "on" : undefined });
+      return scrollToBottom(true);
+    }
     // Slash commands don't become user messages; echo them like Claude Code.
     if (text.startsWith("/") && isExtCommand(text)) addItem({ id: nextId("c"), kind: "command", text });
     S.stuck = true;
@@ -1472,9 +1522,9 @@
   function updateSlash() {
     const v = input().value;
     const m = v.match(/^\/(\S*)$/);
-    if (!m || !S.commands.length) return closeSlash();
+    if (!m) return closeSlash();
     const q = m[1].toLowerCase();
-    const list = S.commands
+    const list = [...LOCAL_COMMANDS, ...S.commands]
       .filter((c) => c.name.toLowerCase().includes(q))
       .sort((a, b) => (a.name.toLowerCase().startsWith(q) ? 0 : 1) - (b.name.toLowerCase().startsWith(q) ? 0 : 1))
       .slice(0, 50);
@@ -1658,6 +1708,11 @@
       return afterAnswer(item);
     }
     if (!ask.draft.trim()) return ta?.focus();
+    // Retries skip the confidence question: it was asked on the first try.
+    if (ask.retry) {
+      sendAnswer(ask, { answer: ask.draft, hintsUsed: ask.hintsShown || 0 });
+      return afterAnswer(item);
+    }
     ask.pending = { answer: ask.draft };
     ask.stage = "confidence";
     renderItem(item);
@@ -1790,6 +1845,10 @@
         if (act === "quiz-submit") return submitQuiz(item);
         if (act === "typed-submit") return submitTyped(item, false);
         if (act === "typed-dontknow") return submitTyped(item, true);
+        if (act === "typed-reveal") {
+          sendAnswer(item.ask, { reveal: true, hintsUsed: item.ask.hintsShown || 0 });
+          return afterAnswer(item);
+        }
         if (act === "q-send") return submitQuestion(item);
       }
       if (item.kind === "tool" && (act === "fb-continue" || act === "fb-dispute")) return feedbackChoice(item, act === "fb-dispute");
@@ -2086,6 +2145,10 @@
       case "model":
         S.model = m.model;
         return renderFooter();
+      case "hideWorking":
+        S.hideWorking = Boolean(m.value);
+        document.body.classList.toggle("hide-working", S.hideWorking);
+        return;
       case "needsKey":
         if (!S.byId.has("setup-key")) addItem({ id: "setup-key", kind: "setup" });
         return;
@@ -2140,6 +2203,7 @@
   });
 
   shell();
+  document.body.classList.toggle("hide-working", S.hideWorking);
   renderFooter();
   autosize();
   input().focus();
