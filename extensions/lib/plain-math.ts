@@ -143,3 +143,17 @@ export function looksLikeTextQuiz(text: string): boolean {
 	}
 	return false;
 }
+
+// A problem for the learner to solve, posed as plain chat text ("Evaluate
+// ∫cos⁴x dx … What do you get for the final answer?"). It should be a
+// quiz_typed card: graded, with its hints hidden until asked for.
+const ASKS_FOR_ANSWER =
+	/\b(what do you get|what('s| is) your (final )?answer|final answer|give it a (try|shot)|try (it|this one)( yourself)?|your turn|(can you|now) (evaluate|compute|solve|find|simplify|differentiate|integrate))\b/i;
+export function looksLikeTextProblem(text: string): boolean {
+	const t = text.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, "").trim();
+	const paras = t.split(/\n\s*\n/).filter((p) => p.trim());
+	const ending = paras.slice(-2).join("\n");
+	if (!/\?\s*(\*\*|_)*\s*$/.test(ending) || !ASKS_FOR_ANSWER.test(ending)) return false;
+	// Something to work out: math in the message (a stated problem, not a chat question).
+	return /\$\$|\\\[|\$[^$\n]*(\\int|\\frac|\\lim|\\sum|\^|=)[^$\n]*\$|∫/.test(t);
+}

@@ -9,7 +9,7 @@ import { getBridge } from "../lib/bridge.ts";
 import { registerCustomProvider } from "../lib/custom-provider.ts";
 import { coerceJsonArgs } from "../lib/coerce.ts";
 import { ANSWER_KEY_PATH, ASSESSMENT_PATH, displayPath, folderExists, ResourceIndex } from "../lib/resources.ts";
-import { displayedFields, findPlainMath, looksLikeTextQuiz, repairInputMath } from "../lib/plain-math.ts";
+import { displayedFields, findPlainMath, looksLikeTextProblem, looksLikeTextQuiz, repairInputMath } from "../lib/plain-math.ts";
 import { SubjectRegistry } from "../lib/subjects.ts";
 import { type Approach, APPROACHES, type LessonRating, type QuizOutcome, type QuizPurpose, type QuizRecord, slug, TutorStore } from "../lib/tutor-store.ts";
 
@@ -41,6 +41,7 @@ const MATH_TOOLS = new Set(["quiz", "quiz_typed", "explain_back"]);
 // Bounce a call for plain-text math at most this many times in a row, so a
 // model that can't comply still gets its question through.
 const MAX_MATH_BOUNCES = 2;
+const MAX_REPEAT_BOUNCES = 2;
 const GATED_TOOLS = new Set(["quiz", "quiz_typed", "assign_exercise"]);
 const SUBJECT_TOOLS = new Set(["quiz", "quiz_typed", "assign_exercise", "mark_taught", "explain_back", "set_assessment", "save_course_style", "course_style_sources", "teacher_examples", "course_map_sources", "save_course_map", "tag_concepts"]);
 // Files that describe the course structure (for the topic map).
@@ -84,6 +85,68 @@ function textOf(message: any): string {
 		.filter((b: any) => b?.type === "text")
 		.map((b: any) => b.text)
 		.join("\n");
+}
+
+// ── Re-asking after a miss ──────────────────────────────────────────────────
+// Re-asking a just-missed question only tests memory of the answer shown
+// seconds ago. After a miss the tutor asks a variant, and the original comes
+// back after at least RETEST_GAP other questions (a delayed, effortful retest).
+const RETEST_GAP = 2;
+
+// A question's identity, ignoring LaTeX delimiters, spacing, case and punctuation.
+function questionKey(q: string): string {
+	return q
+		.toLowerCase()
+		.replace(/\\[,;:! ]|\$/g, "")
+		.replace(/[\s?.!:,;'"`]/g, "");
+}
+
+// Exact match only: a real variant can differ from the original by a single
+// character (a 3 in place of a 1), so no fuzzy matching.
+const sameQuestion = (a: string, b: string): boolean => a === b;
+
+interface AskedQuestion {
+	question: string;
+	key: string;
+	correct: boolean;
+}
+
+// Graded questions the learner answered in this session, oldest first.
+function sessionQuestions(branch: any[]): AskedQuestion[] {
+	const out: AskedQuestion[] = [];
+	for (const e of branch) {
+		const m = e?.message;
+		if (m?.role !== "toolResult" || !QUIZ_TOOLS.has(m.toolName) || m.details?.status !== "answered") continue;
+		if (typeof m.details.question !== "string") continue;
+		out.push({ question: m.details.question, key: questionKey(m.details.question), correct: Boolean(m.details.correct) });
+	}
+	return out;
+}
+
+// Misses not asked again yet: `ready` once RETEST_GAP other questions came after.
+function pendingRetests(asked: AskedQuestion[]): { miss: AskedQuestion; since: number }[] {
+	const out: { miss: AskedQuestion; since: number }[] = [];
+	asked.forEach((q, i) => {
+		if (q.correct) return;
+		const later = asked.slice(i + 1);
+		if (later.some((x) => sameQuestion(x.key, q.key))) return;
+		if (out.some((x) => sameQuestion(x.miss.key, q.key))) return;
+		out.push({ miss: q, since: later.length });
+	});
+	return out;
+}
+
+// A reply that stops inside a math expression: an unclosed $$…, or a last line
+// whose final $ opens LaTeX that never closes. (Some routers cut a reply short
+// and still report a normal stop.)
+function endsMidMath(text: string): boolean {
+	const t = text.replace(/```[\s\S]*?(```|$)/g, "").replace(/`[^`\n]*`/g, "").replace(/\\\$/g, "");
+	if ((t.match(/\$\$/g) ?? []).length % 2) return true;
+	const last = t.replace(/\$\$[\s\S]*?\$\$/g, "").trimEnd().split("\n").pop() ?? "";
+	const dollars = (last.match(/\$/g) ?? []).length;
+	if (dollars % 2 === 0) return false;
+	const tail = last.slice(last.lastIndexOf("$") + 1);
+	return /\\[A-Za-z]|[_^=+\-*/(){}]/.test(tail);
 }
 
 // The subject a session file was tagged with (its last tutor-subject entry).
@@ -335,18 +398,39 @@ export default function tutor(pi: ExtensionAPI) {
 	// reasoning and no visible text — the learner sees nothing useful. Nudge
 	// the model once per learner message to actually write its reply.
 	let nudgedSinceUser = false;
+	let cutNudgedSinceUser = false; // "you were cut off mid-formula" sent since the learner's last message
 	let textQuizNudges = 0; // consecutive "re-ask that as a quiz" nudges (reset by a real quiz call)
+	let textProblemNudges = 0; // consecutive "pose that problem as a quiz_typed card" nudges (same reset)
 	pi.on("message_end", async (event) => {
 		const m: any = event.message;
 		if (m?.role === "user") {
 			nudgedSinceUser = false;
+			cutNudgedSinceUser = false;
 			return;
 		}
 		if (m?.role !== "assistant") return;
 		const hasToolCall = (m.content ?? []).some((b: any) => b?.type === "toolCall");
 		// A multiple-choice question typed into chat ("A) … B) … C) …") can't be
 		// clicked or graded: have the model ask it again through the quiz tool.
-		if (hasToolCall && (m.content ?? []).some((b: any) => b?.type === "toolCall" && QUIZ_TOOLS.has(b.name))) textQuizNudges = 0;
+		if (hasToolCall && (m.content ?? []).some((b: any) => b?.type === "toolCall" && QUIZ_TOOLS.has(b.name))) textQuizNudges = textProblemNudges = 0;
+		// A practice problem typed into chat: the learner answers in the chat box,
+		// nothing is graded, and the hints sit in plain sight. Re-pose it as a card.
+		if (m.stopReason === "stop" && !hasToolCall && !looksLikeTextQuiz(textOf(m)) && looksLikeTextProblem(textOf(m)) && textProblemNudges < 2) {
+			textProblemNudges++;
+			pi.sendMessage(
+				{
+					customType: "tutor-nudge",
+					content:
+						"You just posed a problem for the learner to solve as plain chat text, so their answer won't be graded and your hint gives the method away. " +
+						"Pose that same problem again right now with quiz_typed: `question` = only the problem statement (no method, identity or steps); the method, identities and first step go in the `hints` ladder, which stays hidden until they ask; " +
+						"the full worked solution goes in `explanation` (shown only after they get it or ask for the answer); for an expression answer pass `math` (upToConstant: true for an integral) and the answer in acceptedAnswers[0]. " +
+						"Don't write any text before the call and don't repeat the problem in chat — the card shows it.",
+					display: false,
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+			return;
+		}
 		if (m.stopReason === "stop" && !hasToolCall && looksLikeTextQuiz(textOf(m)) && textQuizNudges < 2) {
 			textQuizNudges++;
 			pi.sendMessage(
@@ -356,6 +440,19 @@ export default function tutor(pi: ExtensionAPI) {
 						"You just wrote a multiple-choice question as plain chat text, so the learner can't click an answer and it won't be graded or recorded. " +
 						"Ask that same question again right now by calling the quiz tool (options as an array, explanation, correctAnswer, subject, concepts; all math in LaTeX $...$). " +
 						"Don't write any text before the tool call and don't repeat the question in chat — the quiz card shows it. From now on every question with a right answer goes through quiz or quiz_typed.",
+					display: false,
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+			return;
+		}
+		if (!hasToolCall && !cutNudgedSinceUser && (m.stopReason === "stop" || m.stopReason === "length") && endsMidMath(textOf(m))) {
+			cutNudgedSinceUser = true;
+			const tail = textOf(m).trimEnd().slice(-80);
+			pi.sendMessage(
+				{
+					customType: "tutor-nudge",
+					content: `Your last reply was cut off in the middle of a math expression; it ends with: «${tail}». Continue exactly where it stopped: start with the rest of that expression (closing its $), then finish the reply. Don't repeat anything you already wrote.`,
 					display: false,
 				},
 				{ deliverAs: "followUp", triggerTurn: true },
@@ -627,6 +724,14 @@ export default function tutor(pi: ExtensionAPI) {
 				topicBlock = `\n\nNo course topic map for ${activeSubject} yet. Build one soon (course_map_sources, then save_course_map) so the progress dashboard can show which parts of the course are covered.`;
 			}
 		}
+		// Missed questions whose delayed re-test is due (see RETEST_GAP).
+		const due = pendingRetests(sessionQuestions(ctx.sessionManager.getBranch() as any[])).filter((p) => p.since >= RETEST_GAP);
+		const retest = due.length
+			? `\n\n## Re-test due (missed earlier this session)\nThese were missed and enough other questions have come since. Ask one again now as your next graded question, the original question as it was asked (not a variant), unless the learner is mid-way through something else. Tell them it's the question they missed earlier.\n${due
+					.slice(0, 3)
+					.map((p) => `- ${p.miss.question}`)
+					.join("\n")}`
+			: "";
 		const subjectBlock = activeSubject
 			? `## Current subject: ${activeSubject}
 This session is for ${activeSubject}. Pass subject "${activeSubject}" to quiz, quiz_typed, mark_taught and assign_exercise. Concepts recorded so far: ${store.conceptIndex(data, activeSubject)}.${topicBlock}`
@@ -647,8 +752,13 @@ This session is for ${activeSubject}. Pass subject "${activeSubject}" to quiz, q
 					? `${stuck.misses} misses in a row on "${stuck.concept}"${stuck.hintsUsed ? ` even with ${stuck.hintsUsed} hint(s)` : ""}`
 					: "the learner asked to be shown";
 			if (stuck && !frustrated) store.addSignal({ subject: activeSubject, kind: "escape-hatch", detail: why });
+			const asked = frustrated || (recentDirect && !stuck);
 			escape = `\n\n## ESCAPE HATCH ACTIVE — ${why}
-Switch to DIRECT instruction now. Explain the idea plainly and walk through one fully worked example of exactly this kind of problem (no more Socratic questions on this point), then give ONE easier check. Acknowledge the difficulty briefly and warmly; don't lecture about effort. Return to the normal flow once they get the easier check right. (Strict withholding after genuine effort lowers learning and pushes students to other tools.)`;
+${
+	asked
+		? "They asked to be shown, so show them: explain the idea plainly and walk through the solution of the problem they're on (no more Socratic questions on this point), then give ONE easier check."
+		: "Stop testing this idea and teach it directly, but don't solve their problem for them: walk through one fully worked example of a PARALLEL problem (same method, different numbers or function), then hand their own problem back for another try. Offer to show their problem's full solution if they want it; show it only if they say yes."
+} Acknowledge the difficulty briefly and warmly; don't lecture about effort. Return to the normal flow once they get a check right. (Strict withholding after genuine effort lowers learning; doing the work for them does too.)`;
 		}
 
 		// Exams and due dates the learner has told us about.
@@ -673,7 +783,7 @@ Switch to DIRECT instruction now. Explain the idea plainly and walk through one 
 
 # Tutor system (persistent across sessions)
 
-${subjectBlock}${escape}
+${subjectBlock}${retest}${escape}
 
 ## Learner profile — follow it; it overrides general teaching defaults
 ${profile}
@@ -691,10 +801,13 @@ ${resources}
 - Teach first, then quiz. After you teach a concept (the teach loop's establish + connect steps), call mark_taught with the subject, the concept name(s), the \`approach\` you used (socratic, worked-example, direct, analogy, visual, code-first, practice-first) and a \`family\` for concepts that are easily confused with each other (e.g. "integration techniques", "convergence tests", "loop patterns"). quiz/quiz_typed with purpose "check", "review" or "checkpoint" are BLOCKED for concepts that weren't marked taught. Use purpose "diagnostic" to probe prior knowledge before teaching, and "discovery" for Socratic questions where they work out the concept you are about to establish.
 - Personalise from evidence: follow the measured approach ranking above, but try a different approach about one time in four so the comparison stays honest. After explaining a concept, the learner can rate it (Clicked / Still fuzzy / Too fast / Too slow); adapt immediately to those ratings.
 - Explain-it-back: ask before you explain. Before explaining a result, a code output, a mistake or a step they just saw, have them explain it first (explain_back; quiz and quiz_typed do this automatically after a miss or a guess). Evaluate their explanation, fix the exact gap, call rate_explanation. Don't add explain-back to worked examples you are demonstrating.
-- Hint ladder, not answers: during practice give hints in steps (pass \`hints\` to quiz/quiz_typed: guiding question → technique → first step). Don't hand over a full solution while they are still attempting. After two genuine failed attempts or an exhausted ladder, switch to direct instruction (the escape hatch).
+- Hint ladder, not answers: during practice give hints in steps (pass \`hints\` to quiz/quiz_typed: guiding question → technique → first step). Don't hand over a full solution while they are still attempting. After two genuine failed attempts or an exhausted ladder, teach with a worked PARALLEL example and hand their problem back (the escape hatch); show their own problem's solution only when they ask.
+- The learner does the work. Never solve the learner's problem for them unless they ask ("Show answer", "Just show me", or in words). Pose practice problems with quiz_typed (question = only the problem; method and identities in the hidden hints). When they answer partly right in chat, say exactly which part is right and ask for the next step; give at most one hint, not the rest of the solution. Don't put the method in the problem statement.
 - No-help checkpoints: every few lessons, and before any exam, run a checkpoint (/checkpoint, or quiz with purpose "checkpoint": no hints, no teaching between questions; explain afterwards). Only checkpoints prove mastery.
 - Interleave practice: when reviewing or practising concepts from the same family, mix them so the learner must first identify WHICH technique applies, then solve (/practice builds such sets). Never interleave definitions or reading — only problem types.
-- Confidence: confident misses are misconceptions — confront them with a contrasting example and re-check soon; correct guesses are not yet learned.
+- Confidence: confident misses are misconceptions — confront them with a contrasting example; feedback fixes them best, but they return within days without practice, so re-test them later in the session and at the next review. Correct guesses are not yet learned.
+- After a miss: (1) brief elaborated feedback — the specific misconception, why the right method works, one contrasting case; (2) one specific "why" prompt so they state the difference; (3) a VARIANT question with the same deep structure and a new surface (different constants, form or direction), never the identical question — the learner would only recall the answer you just showed; (4) re-test the original after at least two other questions ("Re-test due" below lists them). Two misses in a row on one idea: stop testing, work a PARALLEL example (not their problem), then let them retry theirs.
+- Successive relearning: a concept is solid after about three correct, spaced recalls across sessions, not one success today. Fade worked examples into problems as the learner succeeds.
 - Keep concept names stable and reuse them exactly (tutor_progress lists them). One concept = one idea the learner can be quizzed on.
 - Every question with a right answer goes through quiz or quiz_typed — never ask_user_question and never as plain chat text — so the learner is graded and sees the correct answer and explanation. Never reveal the answer in the question's details.
 - Every computable question (code output, arithmetic, calculus) gets a verify block so the key is checked by actually running it.
@@ -711,6 +824,7 @@ ${resources}
 
 	// ── Gates: unanswered note, teach-first ──────────────────────────────────
 	let mathBounces = 0;
+	let repeatBounces = 0;
 	pi.on("tool_call", async (event, ctx) => {
 		const input = event.input as any;
 
@@ -744,6 +858,23 @@ ${resources}
 					"with a worked explanation and a verify check where it's computable. The learner then sees ✓/✗, the correct answer and the explanation immediately. " +
 					"Do not put the answer or a hint that gives it away in `details`. ask_user_question is only for preferences and decisions.",
 			};
+		}
+
+		// A just-missed question can't be re-asked right away: ask a variant.
+		if (QUIZ_TOOLS.has(event.toolName) && typeof input.question === "string") {
+			const key = questionKey(input.question);
+			const early = pendingRetests(sessionQuestions(ctx.sessionManager.getBranch() as any[])).find((p) => p.since < RETEST_GAP && sameQuestion(p.miss.key, key));
+			if (early && repeatBounces < MAX_REPEAT_BOUNCES) {
+				repeatBounces++;
+				return {
+					block: true,
+					reason:
+						"The learner just missed this exact question. Re-asking it now only tests whether they remember the answer you just showed, which isn't learning. " +
+						"Ask a VARIANT instead: the same idea with a new surface (different constants, a different form, or the reverse direction; e.g. after missing $\\int \\frac{1}{\\sqrt{1-x^2}}\\,dx$, ask $\\int \\frac{3}{\\sqrt{1-x^2}}\\,dx$ or $\\frac{d}{dx}\\arcsin(2x)$). " +
+						`The original question comes back as a delayed re-test after ${RETEST_GAP} other questions.`,
+				};
+			}
+			repeatBounces = 0;
 		}
 
 		if (!GATED_TOOLS.has(event.toolName)) return;
@@ -851,6 +982,7 @@ ${resources}
 			note: d.note,
 			confidence: [1, 2, 3].includes(d.confidence) ? d.confidence : undefined,
 			hintsUsed: Number(d.hintsUsed) || 0,
+			attempts: Number(d.attempts) > 1 ? Number(d.attempts) : undefined,
 			selfExplanation: d.selfExplanation,
 		};
 		if (d.wantsDirect) store.addSignal({ subject: record.subject, kind: "asked-for-answer", detail: record.question.slice(0, 120) });
@@ -1034,7 +1166,7 @@ ${resources}
 		description: "Record how good the learner's own explanation (explain-it-back) was, after you've compared it with the correct reasoning. Feeds the learner model.",
 		parameters: Type.Object({
 			quality: Type.Union([Type.Literal("good"), Type.Literal("partial"), Type.Literal("missing")], {
-				description: "good = correct and complete reasoning; partial = right idea with a gap or error; missing = no real explanation / wrong reasoning.",
+				description: "good = correct and complete reasoning; partial = a real attempt with the right idea, cue or slip identified but a gap, error or no full reasoning; missing = no real attempt (blank, 'I don't know', or unrelated).",
 			}),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {

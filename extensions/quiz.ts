@@ -2,6 +2,7 @@ import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { getBridge } from "./lib/bridge.ts";
 import { coerceJsonArgs } from "./lib/coerce.ts";
+import { type MathSpec, mathEquivalent } from "./lib/math-equiv.ts";
 import { describeFailure, labelDescribesFailure, type Language, normalizeOutput, runCode } from "./lib/run-code.ts";
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -161,8 +162,23 @@ const QuizTypedParams = Type.Object({
 		}),
 	),
 	caseSensitive: Type.Optional(Type.Boolean({ description: "Default false. Set true when case matters (e.g. exact program output with capitals)." })),
+	math: Type.Optional(
+		Type.Object(
+			{
+				variable: Type.Optional(Type.String({ description: "The variable, default x." })),
+				upToConstant: Type.Optional(Type.Boolean({ description: "true for antiderivatives: any answer differing by a constant (+C) counts." })),
+			},
+			{
+				description:
+					"Grade a math answer by meaning, not spelling: the learner's expression is compared with acceptedAnswers[0] by sympy, so any equivalent form counts ('3x/8 + sin(2x)/4' = '\\frac{3}{8}x + \\frac{1}{4}\\sin(2x)'). Use for every expression answer (integrals, derivatives, simplifications, identities).",
+			},
+		),
+	),
 	verify: VerifyParam,
 });
+
+// Wrong typed answers on practice questions: try again before the answer shows.
+const TYPED_ATTEMPTS = 3;
 
 // Trim choices, default each value to its label, drop empty ones. Two choices
 // with the same value can't be graded apart, so that's an error.
@@ -434,12 +450,13 @@ function learnerSignalsText(r: QuizResponse, correct: boolean, extras: ChoiceExt
 	if (extras.checkpoint) t += "\n(No-help checkpoint question.)";
 	if (r.confidence) {
 		t += `\nConfidence: ${CONFIDENCE_LABELS[r.confidence]}.`;
-		if (!correct && !r.dontKnow && r.confidence === 3) t += " CONFIDENT MISS — a real misconception is likely: name it and confront it with a contrasting example, then re-check soon.";
+		if (!correct && !r.dontKnow && r.confidence === 3) t += " CONFIDENT MISS — a real misconception is likely: name it and confront it with a contrasting example. Tell them confident mistakes are the ones feedback fixes best, but they come back without practice, so it will be re-tested later.";
 		if (correct && r.confidence === 1) t += " Correct but a guess — treat as not yet learned.";
 	}
+	if (!correct) t += "\nNext (after a miss): brief elaborated feedback on the specific misconception, then a VARIANT question on the same idea with a new surface (different constants, form or direction). Do NOT re-ask this same question now; it gets re-tested later, after at least two other questions.";
 	if (r.hintsUsed) t += `\nHints used: ${r.hintsUsed}${extras.hints ? ` of ${extras.hints.length}` : ""} (assisted — doesn't count as mastery).`;
-	if (r.wantsDirect) t += "\nThe learner pressed 'Just show me': switch to DIRECT instruction now — a clear worked explanation of this exact problem, then one easier check. No more Socratic questions on this point.";
-	else if (r.selfExplanation) t += `\nLearner's own explanation (explain-it-back, written before seeing yours): «${r.selfExplanation}»\nEvaluate it first: say exactly what they got right, correct the specific gap, then call rate_explanation (good / partial / missing).`;
+	if (r.wantsDirect) t += "\nThe learner pressed 'Just show me' (they asked to be shown): give a clear worked explanation of this exact problem now, then one easier check. No more Socratic questions on this point.";
+	else if (r.selfExplanation) t += `\nLearner's own explanation (explain-it-back, written before seeing yours): «${r.selfExplanation}»\nEvaluate it first: say exactly what they got right, correct the specific gap, then call rate_explanation (good / partial / missing; a real attempt that names the right cue or slip is at least partial).`;
 	else if (needsExplainBack(r.dontKnow, correct, r.confidence)) t += "\n(They skipped explaining it back.)";
 	return t;
 }
@@ -587,12 +604,13 @@ export default function quiz(pi: ExtensionAPI) {
 		promptSnippet: "Use quiz_typed for graded free-response questions (code tracing, short computations) where multiple choice would allow guessing.",
 		promptGuidelines: [
 			"quiz_typed: prefer it over quiz for 'what does this code print' once the learner has seen the concept once via multiple choice — typing the full output proves they actually traced it. Always pass verify with the program so the expected answer is the real output.",
-			"quiz_typed: for math, list every reasonable equivalent form in acceptedAnswers (factor orders, with/without spaces or *), because grading is literal.",
+			"quiz_typed: for a math expression answer, pass `math` (upToConstant: true for antiderivatives) so any equivalent form is accepted; put the answer in acceptedAnswers[0] in plain or LaTeX form.",
+			"quiz_typed: use it for every practice problem with a computed answer (worksheet problems, integrals, derivatives). The question states only the problem: never the method, the identity to use or a worked step; those go in the hidden `hints` ladder. A wrong answer lets the learner try again (up to 3 tries) before the answer is shown.",
 			"quiz_typed: if the result says the learner DISPUTED the grade, judge their answer honestly on substance. Then call resolve_dispute with your verdict and tell them plainly whether they were right.",
 			"quiz_typed: like quiz, pass a graduated `hints` ladder on practice questions (never with purpose 'checkpoint'); confidence and explain-it-back are collected the same way.",
 		],
 		parameters: QuizTypedParams,
-		prepareArguments: (args: any) => coerceJsonArgs(args, ["concepts", "hints", "acceptedAnswers", "verify"]),
+		prepareArguments: (args: any) => coerceJsonArgs(args, ["concepts", "hints", "acceptedAnswers", "verify", "math"]),
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const explanation = params.explanation.trim();
@@ -624,20 +642,24 @@ export default function quiz(pi: ExtensionAPI) {
 			if (!accepted.length) return fail("quiz_typed needs acceptedAnswers, or verify in 'output' mode.");
 			if (signal?.aborted) return fail("User cancelled the quiz");
 			const expected = accepted[0];
-			const grade = (answer: string) => {
+			const spec = params.math as MathSpec | undefined;
+			if (spec && (await mathEquivalent(expected, expected, spec)) === "error")
+				return fail(`quiz_typed: math grading couldn't read acceptedAnswers[0] ("${expected}"). Write it as a plain expression (e.g. 3*x/8 + sin(2*x)/4 + C) or simple LaTeX.`);
+			const grade = async (answer: string) => {
 				const dontKnow = answer.length === 0 || /^(i don'?t know|idk|not sure|\?)$/i.test(answer);
-				const correct = !dontKnow && accepted.some((a) => normalizeTyped(a, caseSensitive) === normalizeTyped(answer, caseSensitive));
+				let correct = !dontKnow && accepted.some((a) => normalizeTyped(a, caseSensitive) === normalizeTyped(answer, caseSensitive));
+				if (!correct && !dontKnow && spec) correct = (await mathEquivalent(answer, expected, spec)) === "equal";
 				return { dontKnow, correct };
 			};
 			const hints = params.purpose === "checkpoint" ? [] : (params.hints ?? []).map((h) => h.trim()).filter(Boolean).slice(0, 3);
 			const extras: ChoiceExtras = { checkpoint: params.purpose === "checkpoint", hints };
-			const typedResult = (answer: string, dontKnow: boolean, correct: boolean, disputed: boolean, sig: Partial<QuizResponse> = {}) => {
+			const typedResult = (answer: string, dontKnow: boolean, correct: boolean, disputed: boolean, sig: Partial<QuizResponse> = {}, rt: { attempts: number; tries: string[]; revealed: boolean } = { attempts: 1, tries: [], revealed: false }) => {
 				let text: string;
 				if (dontKnow) text = `User said they don't know (no attempt — a genuine gap, not a wrong guess).\nExpected: ${expected}`;
-				else if (correct) text = `User answered correctly.\nTyped: ${answer}`;
+				else if (correct) text = `User answered correctly${rt.attempts > 1 ? ` on try ${rt.attempts} (earlier tries: ${rt.tries.map((t) => `«${t}»`).join(", ")}) — they found it themselves after a miss; assisted, not yet solid` : ""}.\nTyped: ${answer}`;
 				else if (disputed)
 					text = `User answered "${answer}", which did not literally match "${expected}", and DISPUTED the grade (they believe it's equivalent). Judge it on substance, call resolve_dispute with your verdict, and tell them which it is and why.`;
-				else text = `User answered incorrectly.\nTyped: ${answer}\nExpected: ${expected}`;
+				else text = `User answered incorrectly${rt.attempts > 1 ? ` after ${rt.attempts} tries (${[...rt.tries, ...(rt.revealed ? [] : [answer])].map((t) => `«${t}»`).join(", ")})` : ""}${rt.revealed ? " and pressed Show answer" : ""}.\nTyped: ${answer}\nExpected: ${expected}`;
 				text += learnerSignalsText({ dontKnow, answers: [], ...sig }, correct, extras);
 				text += `\nExplanation: ${explanation}`;
 				return {
@@ -655,6 +677,9 @@ export default function quiz(pi: ExtensionAPI) {
 						confidence: sig.confidence,
 						hintsUsed: sig.hintsUsed ?? 0,
 						hintsAvailable: hints.length,
+						attempts: rt.attempts,
+						earlierTries: rt.tries,
+						revealed: rt.revealed,
 						selfExplanation: sig.selfExplanation,
 						wantsDirect: sig.wantsDirect,
 						checkpoint: extras.checkpoint,
@@ -665,14 +690,50 @@ export default function quiz(pi: ExtensionAPI) {
 			{
 				const bridge = getBridge();
 				if (!bridge.hasPanel()) return fail("quiz_typed needs the TutorBot panel in VS Code");
-				const r = await bridge.ask("typed", { toolCallId, question: params.question, context: params.details, purpose: params.purpose, checkpoint: extras.checkpoint, hints }, signal);
-				if (!r) return { content: [{ type: "text" as const, text: "User cancelled the quiz" }], details: { status: "cancelled", question: params.question } };
-				const answer = String(r.dontKnow ? "" : (r.answer ?? "")).trim();
-				const { dontKnow, correct } = grade(answer);
-				const sig: Partial<QuizResponse> = {
-					confidence: [1, 2, 3].includes(r.confidence) ? r.confidence : undefined,
-					hintsUsed: Math.max(0, Math.min(hints.length, Number(r.hintsUsed) || 0)),
-				};
+				// Practice: a wrong answer re-opens the box ("Not quite — try again")
+				// until it's right, the learner asks for the answer, or tries run out.
+				// No-help checkpoints get one try.
+				const maxTries = extras.checkpoint ? 1 : TYPED_ATTEMPTS;
+				const tries: string[] = [];
+				let r: any;
+				let answer = "";
+				let dontKnow = false;
+				let correct = false;
+				let confidence: 1 | 2 | 3 | undefined;
+				let hintsUsed = 0;
+				while (true) {
+					r = await bridge.ask(
+						"typed",
+						{
+							toolCallId,
+							question: params.question,
+							context: params.details,
+							purpose: params.purpose,
+							checkpoint: extras.checkpoint,
+							hints,
+							retry: tries.length ? { previous: tries[tries.length - 1], attempt: tries.length + 1, of: maxTries, hintsShown: hintsUsed } : undefined,
+						},
+						signal,
+					);
+					if (!r) return { content: [{ type: "text" as const, text: "User cancelled the quiz" }], details: { status: "cancelled", question: params.question } };
+					hintsUsed = Math.max(hintsUsed, Math.min(hints.length, Number(r.hintsUsed) || 0));
+					if (confidence === undefined && [1, 2, 3].includes(r.confidence)) confidence = r.confidence;
+					if (r.reveal) {
+						// "Show answer" after a wrong try: graded as that wrong try.
+						answer = tries[tries.length - 1] ?? "";
+						dontKnow = !answer;
+						correct = false;
+						break;
+					}
+					answer = String(r.dontKnow ? "" : (r.answer ?? "")).trim();
+					({ dontKnow, correct } = await grade(answer));
+					if (correct || dontKnow || tries.length + 1 >= maxTries) break;
+					tries.push(answer);
+				}
+				const attempts = tries.length + (r.reveal ? 0 : 1);
+				// After "Show answer" the last try is the answer shown on the card.
+				const earlier = r.reveal ? tries.slice(0, -1) : tries;
+				const sig: Partial<QuizResponse> = { confidence, hintsUsed };
 				// Explain-it-back before the explanation is revealed.
 				if (needsExplainBack(dontKnow, correct, sig.confidence)) {
 					const ex = await bridge.ask("explain_back", { toolCallId, correct, yourAnswer: answer, correctAnswer: expected }, signal);
@@ -680,8 +741,8 @@ export default function quiz(pi: ExtensionAPI) {
 					else if (typeof ex?.text === "string" && ex.text.trim()) sig.selfExplanation = ex.text.trim().slice(0, 4000);
 				}
 				// Then show ✓/✗ + explanation; on a miss the learner may dispute.
-				const fb = await bridge.ask("typed_feedback", { toolCallId, question: params.question, answer, dontKnow, correct, expected, explanation, selfExplanation: sig.selfExplanation }, signal);
-				return typedResult(answer, dontKnow, correct, Boolean(fb?.disputed) && !dontKnow && !correct, sig);
+				const fb = await bridge.ask("typed_feedback", { toolCallId, question: params.question, answer, dontKnow, correct, expected, explanation, selfExplanation: sig.selfExplanation, attempts, earlierTries: earlier }, signal);
+				return typedResult(answer, dontKnow, correct, Boolean(fb?.disputed) && !dontKnow && !correct, sig, { attempts, tries: earlier, revealed: Boolean(r.reveal) });
 			}
 		},
 
@@ -716,7 +777,7 @@ export default function quiz(pi: ExtensionAPI) {
 			const body = wantsDirect
 				? "The learner pressed 'Just show me': explain it directly now (clear and concrete), then one easier check."
 				: text
-					? `Learner's explanation: «${text}»\nYour reference: ${reference}\nCompare them: say exactly what they got right, correct the specific gap (or confirm it's complete), then call rate_explanation (good / partial / missing).`
+					? `Learner's explanation: «${text}»\nYour reference: ${reference}\nCompare them: say exactly what they got right, correct the specific gap (or confirm it's complete), then call rate_explanation (good / partial / missing; a real attempt that names the right cue or slip is at least partial).`
 					: `The learner skipped explaining. Explain it now, then ask a quick check question.\nYour reference: ${reference}`;
 			return {
 				content: [{ type: "text" as const, text: body }],

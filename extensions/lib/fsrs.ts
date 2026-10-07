@@ -31,19 +31,21 @@ export interface GradedAnswer {
 	outcome: string;
 	confidence?: number;
 	hintsUsed?: number;
+	attempts?: number; // typed answers: right on a retry after a miss
 	kind?: string;
 }
 
 // How an answer maps to an FSRS rating. Undefined = not a memory event.
 //   miss / "I don't know"            → Again
-//   correct with hints, or a guess   → Hard
+//   correct with hints, on a retry,
+//   or a guess                       → Hard
 //   checkpoint, certain              → Easy
 //   any other correct answer         → Good
 export function ratingFor(a: GradedAnswer): Rating | undefined {
 	if (a.kind === "explain" || a.purpose === "discovery" || a.outcome === "disputed") return undefined;
 	if (a.purpose === "diagnostic") return a.outcome === "correct" && a.confidence !== 1 ? Rating.Good : undefined;
 	if (a.outcome !== "correct") return Rating.Again;
-	if ((a.hintsUsed ?? 0) > 0 || a.confidence === 1) return Rating.Hard;
+	if ((a.hintsUsed ?? 0) > 0 || (a.attempts ?? 1) > 1 || a.confidence === 1) return Rating.Hard;
 	if (a.purpose === "checkpoint" && a.confidence === 3) return Rating.Easy;
 	return Rating.Good;
 }

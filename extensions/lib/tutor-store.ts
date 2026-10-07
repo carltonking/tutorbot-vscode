@@ -92,6 +92,7 @@ export interface QuizRecord {
 	note?: string;
 	confidence?: Confidence;
 	hintsUsed?: number;
+	attempts?: number; // typed answers: tries before it was right (or the answer was shown)
 	selfExplanation?: string; // explain-it-back text
 	explainQuality?: "good" | "partial" | "missing";
 	approach?: Approach; // approach the concept was taught with
