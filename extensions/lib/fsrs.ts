@@ -70,8 +70,12 @@ function fromCard(c: Card): MemoryState {
 	};
 }
 
-export function reviewMemory(m: MemoryState | undefined, rating: Rating, when: Date): MemoryState {
+export function reviewMemory(m: MemoryState | undefined, rating: Rating, when: Date, now = new Date()): MemoryState {
+	// A timestamp from the future (a bad clock, a hand-edited log) is read as
+	// now: kept as-is it would freeze every later review at that date.
+	if (!(when.getTime() <= now.getTime())) when = now;
 	const card = toCard(m, when);
+	if (card.last_review && !(card.last_review.getTime() <= now.getTime())) card.last_review = now;
 	// Reviews can't go back in time (replaying an old log out of order).
 	const at = card.last_review && when < card.last_review ? card.last_review : when;
 	return fromCard(scheduler.next(card, at, rating as any).card);

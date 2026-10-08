@@ -14,10 +14,15 @@ export interface Subject {
 	lastUsed?: string;
 	lastSession?: string;
 	folders: string[];
+	// The subject folder it's filed under ("Fall 2026", "NYU"…), if any. Not to
+	// be confused with `folders`, its class-material folders.
+	group?: string;
 }
 
 interface Registry {
 	subjects: Record<string, Subject>;
+	// Subject folders, in the learner's order (empty ones included).
+	groups?: string[];
 	// Old slug → new slug, so sessions tagged before a rename still resolve.
 	aliases?: Record<string, string>;
 }
@@ -143,7 +148,87 @@ export class SubjectRegistry {
 		return [...new Set([...globalFolders, ...own])].filter((f) => existsSync(f));
 	}
 
+	// ── subject folders (groups of subjects) ─────────────────────────────────
+
+	// Folder names in order; a folder only a subject mentions is included too.
+	groups(): string[] {
+		const r = this.load();
+		const out = [...(r.groups ?? [])];
+		for (const s of Object.values(r.subjects)) if (s.group && !out.some((g) => sameGroup(g, s.group!))) out.push(s.group);
+		return out;
+	}
+
+	// Subjects in a folder (undefined: subjects in no folder), most recent first.
+	inGroup(group: string | undefined): Subject[] {
+		return this.list().filter((s) => (group === undefined ? !s.group : Boolean(s.group) && sameGroup(s.group!, group)));
+	}
+
+	createGroup(name: string): string {
+		const n = groupName(name);
+		const r = this.load();
+		const existing = (r.groups ?? []).find((g) => sameGroup(g, n));
+		if (existing) return existing;
+		r.groups = [...(r.groups ?? []), n];
+		this.save(r);
+		return n;
+	}
+
+	// Rename a folder; its subjects follow. Refuses to collide with another folder.
+	renameGroup(from: string, to: string): string {
+		const n = groupName(to);
+		const r = this.load();
+		const all = [...(r.groups ?? []), ...Object.values(r.subjects).flatMap((s) => (s.group ? [s.group] : []))];
+		if (!all.some((g) => sameGroup(g, from))) throw new Error(`No folder named "${from}".`);
+		if (!sameGroup(from, n) && all.some((g) => sameGroup(g, n))) throw new Error(`A folder named "${n}" already exists.`);
+		r.groups = (r.groups ?? []).map((g) => (sameGroup(g, from) ? n : g));
+		if (!r.groups.some((g) => sameGroup(g, n))) r.groups.push(n);
+		for (const s of Object.values(r.subjects)) if (s.group && sameGroup(s.group, from)) s.group = n;
+		this.save(r);
+		return n;
+	}
+
+	// Delete a folder. Its subjects aren't deleted: they move out to the top level.
+	deleteGroup(name: string): number {
+		const r = this.load();
+		r.groups = (r.groups ?? []).filter((g) => !sameGroup(g, name));
+		let moved = 0;
+		for (const s of Object.values(r.subjects))
+			if (s.group && sameGroup(s.group, name)) {
+				delete s.group;
+				moved++;
+			}
+		this.save(r);
+		return moved;
+	}
+
+	// File a subject under a folder (created if new), or take it out (undefined).
+	setGroup(subject: string, group: string | undefined): Subject {
+		const r = this.load();
+		const s = r.subjects[this.canonicalKey(r, slug(subject))];
+		if (!s) throw new Error(`No subject named "${subject}".`);
+		if (group === undefined || !group.trim()) delete s.group;
+		else {
+			const n = groupName(group);
+			const existing = [...(r.groups ?? []), ...Object.values(r.subjects).flatMap((x) => (x.group ? [x.group] : []))].find((g) => sameGroup(g, n));
+			s.group = existing ?? n;
+			if (!(r.groups ?? []).some((g) => sameGroup(g, s.group!))) r.groups = [...(r.groups ?? []), s.group];
+		}
+		this.save(r);
+		return s;
+	}
+
 	allFolders(globalFolders: string[]): string[] {
 		return [...new Set([...globalFolders, ...Object.values(this.load().subjects).flatMap((s) => s.folders)])].filter((f) => existsSync(f));
 	}
+}
+
+function groupName(name: string): string {
+	const n = name.replace(/\s+/g, " ").trim();
+	if (!n) throw new Error("A folder name needs at least one character.");
+	return n.slice(0, 60);
+}
+
+// Folder names compare case-insensitively ("nyu" is the "NYU" folder).
+function sameGroup(a: string, b: string): boolean {
+	return a.trim().toLowerCase() === b.trim().toLowerCase();
 }

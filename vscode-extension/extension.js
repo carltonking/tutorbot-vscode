@@ -71,10 +71,11 @@ function piCommand() {
   // -ne/-ns/-np: load only TutorBot, never the user's other pi extensions,
   // skills or prompts; --no-approve: ignore project-local .pi folders.
   const args = [piPath, "--mode", "rpc", "-ne", "-ns", "-np", "--no-approve"];
-  // A tutor reads and runs the learner's code but never rewrites it: pi's
-  // file-editing tools are off. (Exercise files are created by TutorBot's own
-  // assign_exercise tool, not by these.)
-  args.push("--exclude-tools", "edit,write");
+  // None of pi's built-in tools: no shell, no reading or editing arbitrary
+  // files (API keys, the learner's other folders). TutorBot works only through
+  // its own tools — exercise files come from assign_exercise, code runs in
+  // run-code's sandbox, and "Check This File" sends the code in the message.
+  args.push("--no-builtin-tools", "--exclude-tools", "read,bash,edit,write,grep,find,ls");
   for (const e of TUTOR_EXTENSIONS) args.push("-e", path.join(tutor, "extensions", e));
   for (const k of TUTOR_SKILLS) args.push("--skill", path.join(tutor, "skills", k));
   // VS Code's binary runs as plain Node.js with ELECTRON_RUN_AS_NODE.
@@ -608,6 +609,7 @@ class Controller {
         this.subject = data.value ?? null;
         if (this.dashboard) this.dashboard.schedule();
         this.post({ type: "subject", subject: this.subject });
+        this.renderStatusBar();
         this.onSubject();
       }
       if (data.key === "folders") {
@@ -1081,7 +1083,9 @@ class Controller {
   }
 
   renderStatusBar() {
-    const ex = this.exercise;
+    // Only the current subject's exercise shows (a Java exercise isn't shown during Calculus).
+    const key = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    const ex = this.exercise && (!this.subject || !this.exercise.subject || key(this.subject) === key(this.exercise.subject)) ? this.exercise : null;
     if (!ex) {
       const due = this.study && this.study.due ? ` · ${this.study.due} due` : "";
       this.statusItem.text = this.proc && this.proc.running ? `$(mortar-board) TutorBot${this.subject ? ` · ${this.subject}` : ""}${due}` : `$(mortar-board) TutorBot${due}`;
@@ -1150,7 +1154,7 @@ class Controller {
     if (!this.exercise) return vscode.window.showInformationMessage("No TutorBot exercise is active.");
     await this.saveExerciseDoc();
     this.reveal(true);
-    this.bridge.post("submit", {}).catch((e) => vscode.window.showErrorMessage(e.message));
+    this.bridge.post("submit", {}).then((r) => this.showExerciseReply(r), (e) => vscode.window.showErrorMessage(e.message));
   }
 
   async hint() {
@@ -1159,7 +1163,15 @@ class Controller {
     const question = await vscode.window.showInputBox({ title: "Ask TutorBot for a hint", prompt: "Optional: what are you stuck on? (Enter for the next hint)" });
     if (question === undefined) return;
     this.reveal(true);
-    this.bridge.post("hint", { question: question.trim() || undefined }).catch((e) => vscode.window.showErrorMessage(e.message));
+    this.bridge.post("hint", { question: question.trim() || undefined }).then((r) => this.showExerciseReply(r), (e) => vscode.window.showErrorMessage(e.message));
+  }
+
+  // Bridge replies resolve even on failure ({error}); a deleted exercise file,
+  // a missing JDK or "no more hints" must not vanish silently.
+  showExerciseReply(r) {
+    if (r && r.error) return vscode.window.showErrorMessage(`TutorBot: ${r.error}`);
+    const msg = r && r.message;
+    if (msg && !/^(Checking your code|Submitted|Asked TutorBot|Showing the next hint)/.test(msg)) vscode.window.showWarningMessage(`TutorBot: ${msg}`);
   }
 
   // "Check This File": the learner's own program becomes an exercise with
@@ -1174,12 +1186,16 @@ class Controller {
     this.reveal();
     await this.ensureStarted();
     const rel = vscode.workspace.asRelativePath(doc.uri);
+    // TutorBot has no file-reading or shell tools: the code travels in the
+    // message, and assign_exercise (existingFile) runs it against tests.
+    const lines = doc.getText().split("\n");
+    const code = lines.length > 400 ? `${lines.slice(0, 400).join("\n")}\n… (${lines.length - 400} more lines)` : lines.join("\n");
     this.onWebview({
       type: "send",
       text:
-        `Check my code in \`${rel}\` (${doc.uri.fsPath}). Read and run it, then tell me what works and what doesn't. ` +
-        `Then turn it into an exercise (assign_exercise with existingFile) so it's tested as I type; ask me what it should do first if that isn't clear from the code. ` +
-        `Don't rewrite it for me.`,
+        `Check my code in \`${rel}\` (absolute path: ${doc.uri.fsPath}, language: ${doc.languageId}):\n\n\`\`\`${doc.languageId}\n${code.trimEnd()}\n\`\`\`\n\n` +
+        `Tell me what works and what doesn't. Then turn it into an exercise with assign_exercise, passing that absolute path as existingFile, so it's run against tests as I type (no need to read the file: the code is above). ` +
+        `Ask me what it should do first if that isn't clear from the code. Don't rewrite it for me.`,
     });
   }
 
@@ -1258,6 +1274,16 @@ function readJson(file, fallback, strict) {
     if (strict) throw new Error(`${path.basename(file)} couldn't be read (${e.message}). TutorBot may be mid-write; it will retry.`);
     return fallback;
   }
+}
+
+// Subject-folder names: trimmed, compared case-insensitively.
+function groupName(name) {
+  const n = String(name || "").replace(/\s+/g, " ").trim();
+  if (!n) throw new Error("A folder name needs at least one character.");
+  return n.slice(0, 60);
+}
+function sameGroup(a, b) {
+  return String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
 }
 
 function writeJsonAtomic(file, value) {
@@ -1594,19 +1620,144 @@ class SubjectDirectory {
       .sort((a, b) => String(b.lastUsed || b.createdAt || "").localeCompare(String(a.lastUsed || a.createdAt || "")));
   }
 
+  // ── subject folders ("groups"): Fall 2026 › Java, Calc II … ──────────────
+  // Stored in subjects.json (`groups` + each subject's `group`), shared with
+  // TutorBot's /home. Written here directly, so they work before TutorBot starts.
+  registry() {
+    return readJson(path.join(dataDir(), "subjects.json"), { subjects: {} }, true);
+  }
+  editRegistry(fn) {
+    const reg = this.registry();
+    reg.subjects = reg.subjects || {};
+    const out = fn(reg);
+    writeJsonAtomic(path.join(dataDir(), "subjects.json"), reg);
+    this.refresh();
+    return out;
+  }
+  groups(reg = this.registry()) {
+    const out = [...(reg.groups || [])];
+    for (const s of Object.values(reg.subjects || {})) if (s && s.group && !out.some((g) => sameGroup(g, s.group))) out.push(s.group);
+    return out;
+  }
+  createGroup(name) {
+    const n = groupName(name);
+    return this.editRegistry((reg) => {
+      const existing = (reg.groups || []).find((g) => sameGroup(g, n));
+      if (existing) return existing;
+      reg.groups = [...(reg.groups || []), n];
+      return n;
+    });
+  }
+  renameGroup(from, to) {
+    const n = groupName(to);
+    return this.editRegistry((reg) => {
+      const all = this.groups(reg);
+      if (!sameGroup(from, n) && all.some((g) => sameGroup(g, n))) throw new Error(`A folder named "${n}" already exists.`);
+      reg.groups = (reg.groups || []).map((g) => (sameGroup(g, from) ? n : g));
+      if (!reg.groups.some((g) => sameGroup(g, n))) reg.groups.push(n);
+      for (const s of Object.values(reg.subjects)) if (s && s.group && sameGroup(s.group, from)) s.group = n;
+      return n;
+    });
+  }
+  deleteGroup(name) {
+    return this.editRegistry((reg) => {
+      reg.groups = (reg.groups || []).filter((g) => !sameGroup(g, name));
+      let moved = 0;
+      for (const s of Object.values(reg.subjects))
+        if (s && s.group && sameGroup(s.group, name)) {
+          delete s.group;
+          moved++;
+        }
+      return moved;
+    });
+  }
+  // File subjects under a folder (created if new), or take them out (no group).
+  setGroup(names, group) {
+    return this.editRegistry((reg) => {
+      const n = group ? this.groups(reg).find((g) => sameGroup(g, group)) || groupName(group) : undefined;
+      if (n && !(reg.groups || []).some((g) => sameGroup(g, n))) reg.groups = [...(reg.groups || []), n];
+      for (const s of Object.values(reg.subjects)) {
+        if (!s || !names.some((x) => slug(x) === slug(s.name))) continue;
+        if (n) s.group = n;
+        else delete s.group;
+      }
+      return n;
+    });
+  }
+
+  // Drag subjects onto a folder to file them; onto the empty space or a subject
+  // with no folder to take them out.
+  get dropMimeTypes() {
+    return ["application/vnd.code.tree.tutorbot.directory"];
+  }
+  get dragMimeTypes() {
+    return ["application/vnd.code.tree.tutorbot.directory"];
+  }
+  handleDrag(nodes, dataTransfer) {
+    const names = nodes.filter((n) => n.kind === "subject").map((n) => n.subject.name);
+    if (names.length) dataTransfer.set("application/vnd.code.tree.tutorbot.directory", new vscode.DataTransferItem(names));
+  }
+  async handleDrop(target, dataTransfer) {
+    const item = dataTransfer.get("application/vnd.code.tree.tutorbot.directory");
+    const names = item && Array.isArray(item.value) ? item.value : [];
+    if (!names.length) return;
+    const group = !target ? undefined : target.kind === "group" ? target.group : target.kind === "subject" ? target.subject.group : target.subject && target.subject.group;
+    try {
+      this.setGroup(names, group);
+    } catch (e) {
+      vscode.window.showErrorMessage(e.message);
+    }
+  }
+
+  getParent(node) {
+    if (node.kind === "subject" && node.subject.group) return { kind: "group", group: node.subject.group };
+    if ((node.kind === "folder" || node.kind === "addFolder") && node.subject) return this.subjectNode(node.subject);
+    return undefined;
+  }
+
+  subjectNode(s, due = {}) {
+    return { kind: "subject", subject: s, due: due[slug(s.name)] || 0 };
+  }
+
   getChildren(node) {
+    const due = {};
+    for (const [k, v] of Object.entries(this.controller.studyState().bySubject)) due[slug(k)] = (due[slug(k)] || 0) + v;
+    if (node && node.kind === "group") {
+      return this.subjects()
+        .filter((s) => s.group && sameGroup(s.group, node.group))
+        .map((s) => this.subjectNode(s, due));
+    }
     if (node) {
       const folders = (node.subject.folders || []).map((f) => ({ kind: "folder", subject: node.subject, folder: f }));
       return [...folders, { kind: "addFolder", subject: node.subject }];
     }
-    const due = {};
-    for (const [k, v] of Object.entries(this.controller.studyState().bySubject)) due[slug(k)] = (due[slug(k)] || 0) + v;
-    const subjects = this.subjects().map((s) => ({ kind: "subject", subject: s, due: due[slug(s.name)] || 0 }));
+    const all = this.subjects();
+    let groups = [];
+    try {
+      groups = this.groups();
+    } catch {
+      // subjects.json mid-write: show the subjects without folders this time
+    }
+    // Folders first (in the learner's order), then subjects in no folder.
+    const folderNodes = groups.map((g) => {
+      const inside = all.filter((s) => s.group && sameGroup(s.group, g));
+      return { kind: "group", group: g, count: inside.length, due: inside.reduce((n, s) => n + (due[slug(s.name)] || 0), 0) };
+    });
+    const loose = all.filter((s) => !s.group || !groups.some((g) => sameGroup(g, s.group))).map((s) => this.subjectNode(s, due));
     // With no subjects the welcome view (package.json) shows its own button.
-    return subjects.length ? [...subjects, { kind: "addSubject" }] : [];
+    return all.length || folderNodes.length ? [...folderNodes, ...loose, { kind: "addSubject" }] : [];
   }
 
   getTreeItem(node) {
+    if (node.kind === "group") {
+      const item = new vscode.TreeItem(node.group, vscode.TreeItemCollapsibleState.Expanded);
+      item.id = `group:${node.group.toLowerCase()}`;
+      item.description = [`${node.count} subject${node.count === 1 ? "" : "s"}`, node.due ? `${node.due} due` : ""].filter(Boolean).join(" · ");
+      item.tooltip = `Subject folder: ${node.group}\n\nDrag subjects here to file them, or right-click a subject → Move to Subject Folder.`;
+      item.iconPath = new vscode.ThemeIcon("folder-library");
+      item.contextValue = "subjectGroup";
+      return item;
+    }
     if (node.kind === "addSubject") {
       const item = new vscode.TreeItem("Add class");
       item.iconPath = new vscode.ThemeIcon("add");
@@ -1681,7 +1832,7 @@ function activate(context) {
 
   context.subscriptions.push(
     vscode.window.registerWebviewPanelSerializer("tutorbot.chat", { deserializeWebviewPanel: async (panel) => chat.setup(panel) }),
-    vscode.window.registerTreeDataProvider("tutorbot.directory", directory),
+    vscode.window.createTreeView("tutorbot.directory", { treeDataProvider: directory, dragAndDropController: directory, canSelectMany: true }),
     directory,
     { dispose: () => chat.panel && chat.panel.dispose() },
     vscode.commands.registerCommand("tutorbot.openSubject", withSubject("Open which subject?", (name) => controller.openSubject(name))),
@@ -1691,6 +1842,56 @@ function activate(context) {
     vscode.commands.registerCommand("tutorbot.addSubjectFolder", withSubject("Add a class folder to which subject?", (name) => controller.addSubjectFolder(name))),
     vscode.commands.registerCommand("tutorbot.removeSubjectFolder", (node) => node && node.folder && controller.removeSubjectFolder(node.subject.name, node.folder)),
     vscode.commands.registerCommand("tutorbot.refreshSubjects", () => directory.refresh()),
+    vscode.commands.registerCommand("tutorbot.newSubjectGroup", async () => {
+      const name = await vscode.window.showInputBox({ title: "New subject folder", placeHolder: "e.g. Fall 2026, NYU, Personal", validateInput: (v) => (!v.trim() ? "Type a name" : undefined) });
+      if (!name) return;
+      try {
+        directory.createGroup(name);
+      } catch (e) {
+        vscode.window.showErrorMessage(e.message);
+      }
+    }),
+    vscode.commands.registerCommand(
+      "tutorbot.moveSubjectToGroup",
+      withSubject("Move which subject?", async (name, node) => {
+        const current = node && node.subject ? node.subject.group : (directory.subjects().find((s) => s.name === name) || {}).group;
+        const NEW = "$(new-folder) New folder…";
+        const OUT = "$(close) Take it out of its folder";
+        const items = [...directory.groups().map((g) => ({ label: `$(folder-library) ${g}`, group: g, description: current && sameGroup(g, current) ? "current" : "" })), { label: NEW }, ...(current ? [{ label: OUT }] : [])];
+        const pick = await vscode.window.showQuickPick(items, { placeHolder: `Move ${name} into…` });
+        if (!pick) return;
+        let group = pick.group;
+        if (pick.label === NEW) group = await vscode.window.showInputBox({ title: "New subject folder", placeHolder: "e.g. Fall 2026", validateInput: (v) => (!v.trim() ? "Type a name" : undefined) });
+        if (pick.label !== OUT && !group) return;
+        try {
+          directory.setGroup([name], pick.label === OUT ? undefined : group);
+        } catch (e) {
+          vscode.window.showErrorMessage(e.message);
+        }
+      }),
+    ),
+    vscode.commands.registerCommand("tutorbot.renameSubjectGroup", async (node) => {
+      const from = node && node.group ? node.group : await vscode.window.showQuickPick(directory.groups(), { placeHolder: "Rename which subject folder?" });
+      if (!from) return;
+      const to = await vscode.window.showInputBox({ title: `Rename ${from}`, value: from, validateInput: (v) => (!v.trim() ? "Type a name" : undefined) });
+      if (!to || to.trim() === from) return;
+      try {
+        directory.renameGroup(from, to);
+      } catch (e) {
+        vscode.window.showErrorMessage(e.message);
+      }
+    }),
+    vscode.commands.registerCommand("tutorbot.deleteSubjectGroup", async (node) => {
+      const name = node && node.group ? node.group : await vscode.window.showQuickPick(directory.groups(), { placeHolder: "Delete which subject folder?" });
+      if (!name) return;
+      const ok = await vscode.window.showWarningMessage(`Delete the folder ${name}?`, { modal: true, detail: "Only the folder goes. Its subjects move to the top level, with their progress and conversations untouched." }, "Delete Folder");
+      if (ok !== "Delete Folder") return;
+      try {
+        directory.deleteGroup(name);
+      } catch (e) {
+        vscode.window.showErrorMessage(e.message);
+      }
+    }),
     vscode.commands.registerCommand("tutorbot.focus", () => controller.reveal()),
     vscode.commands.registerCommand("tutorbot.launch", () => controller.reveal()),
     vscode.commands.registerCommand("tutorbot.newChat", () => controller.newChat()),

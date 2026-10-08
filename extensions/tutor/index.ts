@@ -7,9 +7,39 @@ import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "
 import { fileURLToPath } from "node:url";
 import { getBridge } from "../lib/bridge.ts";
 import { registerCustomProvider } from "../lib/custom-provider.ts";
-import { coerceJsonArgs } from "../lib/coerce.ts";
+import { coerceJsonArgs, coerceList } from "../lib/coerce.ts";
+import * as Constructs from "../lib/constructs.ts";
+import { type CodeLanguage, type Construct, fencedCode, subjectLanguage, topicFor, untaughtConstructs } from "../lib/constructs.ts";
+import {
+	askedForTopic,
+	BLOCKED_BUILTINS,
+	Bounces,
+	directSignals,
+	distressKind,
+	GRADED_WORK,
+	hasCorrectCheck,
+	hintsWithSolutionLines,
+	lastUserText,
+	leaksSolution,
+	lessonEvidence,
+	lessonGaps,
+	lessonSinceLastMark,
+	looksLikeKnowledgeCheck,
+	MASTERY_STREAK,
+	MIN_WORKED_EXAMPLES,
+	MOVE_ON_REQUEST,
+	noteAddressed,
+	openExercise,
+	probesOn,
+	probesSinceUser,
+	PROBE_PURPOSES,
+	quizKeyLeak,
+	skippedSinceUser,
+	textOf,
+	unmasteredPrevious,
+} from "../lib/gates.ts";
 import { ANSWER_KEY_PATH, ASSESSMENT_PATH, displayPath, folderExists, ResourceIndex } from "../lib/resources.ts";
-import { displayedFields, findPlainMath, looksLikeTextProblem, looksLikeTextQuiz, repairInputMath } from "../lib/plain-math.ts";
+import { displayedFields, endsOnLeadIn, findPlainMath, looksLikeTextProblem, looksLikeTextQuiz, repairInputMath } from "../lib/plain-math.ts";
 import { SubjectRegistry } from "../lib/subjects.ts";
 import { type Approach, APPROACHES, type LessonRating, type QuizOutcome, type QuizPurpose, type QuizRecord, slug, TutorStore } from "../lib/tutor-store.ts";
 
@@ -48,10 +78,6 @@ const SUBJECT_TOOLS = new Set(["quiz", "quiz_typed", "assign_exercise", "mark_ta
 const SYLLABUS_PATH = /(syllabus|schedule|calendar|outline|course[ _-]?(info|overview|plan)|topics|pacing|scope|map|unit[ _-]?plan)/i;
 const RATING_LABEL: Record<LessonRating, string> = { clicked: "Clicked", fuzzy: "Still fuzzy", "too-fast": "Too fast", "too-slow": "Too slow" };
 
-// Signs in the learner's own message that the Socratic approach has stopped
-// working for them (→ the escape hatch switches to direct instruction).
-const FRUSTRATION = /\b(just (tell|give|show) me|tell me the answer|give me the answer|what'?s the answer|i (don'?t|do not) (get|understand)|i'?m (so )?(lost|confused|stuck)|(this|that) (is|makes) no sense|confus(ed|ing)|frustrat|ugh+|wtf|pmo|stop asking|i give up)\b/i;
-
 const NUDGE_LABEL = "com.tutorbot.nudge";
 const nudgePlistPath = () => join(homedir(), "Library", "LaunchAgents", `${NUDGE_LABEL}.plist`);
 const NUDGE_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), "nudge.mjs");
@@ -62,29 +88,9 @@ async function pickFolder(prompt: string, signal?: AbortSignal): Promise<string 
 	return r && typeof r.path === "string" && r.path ? r.path : undefined;
 }
 
-// Does an ask_user_question prompt actually have a right answer? Those must go
-// through quiz/quiz_typed so the learner is graded and shown the correct answer
-// with an explanation. Questions about the learner themself are left alone.
-function looksLikeKnowledgeCheck(question: string, details?: string): boolean {
-	const q = question.trim().toLowerCase();
-	if (/\b(you|your|you'?d|you'?re|prefer|want|would like|should we|shall we|ready|goal|comfortable|feel)\b/.test(q)) return false;
-	if (/[$∫∑√]|\\(int|frac|lim|sum|sqrt)|d\/dx|\blim\b|=\s*\?/.test(question + (details ?? ""))) return true;
-	return /^(what is|what's|what are|evaluate|compute|calculate|find|solve|simplify|differentiate|integrate|derive|define|true or false|what does .* (print|return|output|evaluate)|which (of these|one|option) (is|are|will|would))/.test(q);
-}
-
 function expandPath(p: string): string {
 	const t = p.trim().replace(/^["']|["']$/g, "");
 	return resolve(t.startsWith("~") ? join(homedir(), t.slice(1)) : t);
-}
-
-function textOf(message: any): string {
-	const c = message?.content;
-	if (typeof c === "string") return c;
-	if (!Array.isArray(c)) return "";
-	return c
-		.filter((b: any) => b?.type === "text")
-		.map((b: any) => b.text)
-		.join("\n");
 }
 
 // ── Re-asking after a miss ──────────────────────────────────────────────────
@@ -147,6 +153,67 @@ function endsMidMath(text: string): boolean {
 	if (dollars % 2 === 0) return false;
 	const tail = last.slice(last.lastIndexOf("$") + 1);
 	return /\\[A-Za-z]|[_^=+\-*/(){}]/.test(tail);
+}
+
+// ── Teach-first evidence ────────────────────────────────────────────────────
+// "Taught" must mean the learner actually saw a lesson: an explanation and
+// worked examples in the chat since the last mark_taught (lib/gates.ts).
+// Without this a model marks a whole course as taught in one call and goes
+// straight to quizzing.
+const MAX_NEW_CONCEPTS_PER_LESSON = 2;
+const MAX_PROBES = 3; // diagnostic/discovery questions before the tutor has to teach (per lesson, per concept, per learner message)
+const MAX_GUIDED_BOUNCES = 3; // per lesson: then the model's question goes through
+
+// Mastery gating (a criterion before the next unit) helps most for weaker
+// learners (Kulik et al. 1990, ES ≈ 0.52): MASTERY_STREAK unaided correct
+// checks in a row (right, not a guess, no hints, first try) before the next
+// concept. Unaided, because help during practice inflates scores without
+// learning (Bastani et al. 2025).
+
+// The session branch, or nothing from a ctx whose session was replaced.
+function safeBranch(ctx: any): any[] {
+	try {
+		return (ctx.sessionManager.getBranch() as any[]) ?? [];
+	} catch {
+		return [];
+	}
+}
+
+// The course's topic order for a subject (its topic map), what the learner's
+// concepts already cover, and the first topic nothing covers yet.
+function courseOrder(store: TutorStore, data: ReturnType<TutorStore["loadProgress"]>, subject: string) {
+	const map = store.readTopicMap(subject);
+	if (!map?.topics.length) return undefined;
+	const topics = map.topics.slice().sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+	const links = store.loadLinks();
+	const onMap = new Set(topics.map((t) => t.id));
+	const covered = new Set(store.conceptsForSubject(data, subject).flatMap((c) => [store.effectiveTopic(c, links, onMap).topic, slug(c.name)]).filter(Boolean) as string[]);
+	const next = topics.find((t) => !covered.has(t.id));
+	const index = (id?: string) => (id ? topics.findIndex((t) => t.id === id) : -1);
+	return { topics, covered, next, index };
+}
+
+// Feedback that explains *why* beats right/wrong feedback (high-information
+// feedback d ≈ 0.99 vs corrective d ≈ 0.46; Wisniewski et al. 2020). The
+// explanation shown after an answer must carry reasoning, not just the key.
+function explanationReasoning(explanation: string): number {
+	return explanation
+		.replace(/^\s*(?:\*\*)?(?:final\s+)?answer(?:\*\*)?\s*:.*$/gim, "")
+		.replace(/\s+/g, " ")
+		.trim().length;
+}
+const MIN_EXPLANATION_REASONING = 80;
+
+// A question card the model was writing when the session ended: the last
+// message is an assistant reply whose card tool call never got a result.
+// Only recent ones (an old unfinished session isn't resumed out of the blue).
+const CARD_CALLS = new Set(["quiz", "quiz_typed", "ask_user_question", "explain_back", "assign_exercise"]);
+function interruptedCardCall(branch: any[]): string | undefined {
+	const msgs = branch.filter((e) => e?.type === "message" && e.message);
+	const last = msgs[msgs.length - 1]?.message;
+	if (last?.role !== "assistant" || Date.now() - Number(last.timestamp ?? 0) > 2 * 3_600_000) return undefined;
+	const call = (last.content ?? []).find((b: any) => b?.type === "toolCall" && CARD_CALLS.has(b.name));
+	return call?.name;
 }
 
 // The subject a session file was tagged with (its last tutor-subject entry).
@@ -335,6 +402,27 @@ export default function tutor(pi: ExtensionAPI) {
 			setTimeout(() => pi.sendUserMessage("/subject", { expandPromptTemplates: true }), 300);
 		}
 
+		// Reopened mid-question: TutorBot restarted (or the panel reloaded) while a
+		// quiz was still being written, so the reply ends on its lead-in ("Here is a
+		// variant:") and the card never arrived. Ask it again.
+		const orphan = interruptedCardCall(ctx.sessionManager.getBranch() as any[]);
+		const resumeSid = ctx.sessionManager.getSessionId();
+		if ((event.reason === "resume" || event.reason === "reload") && orphan && g.__tutorResumedFor !== resumeSid) {
+			g.__tutorResumedFor = resumeSid;
+			setTimeout(
+				() =>
+					pi.sendMessage(
+						{
+							customType: "tutor-nudge",
+							content: `TutorBot restarted while your ${orphan} call was in progress, so the learner never saw that question and your last reply ends on its lead-in. Ask it again now by calling ${orphan} with the same question. Don't repeat the text you already wrote and don't mention the restart unless asked.`,
+							display: false,
+						},
+						{ deliverAs: "followUp", triggerTurn: true },
+					),
+				600,
+			);
+		}
+
 		// A new, empty session asks where to start — unless it starts itself
 		// (a /home kickoff message) or the learner explicitly chose free chat.
 		const kickoff = Boolean(g.__tutorKickoff);
@@ -399,17 +487,72 @@ export default function tutor(pi: ExtensionAPI) {
 	// the model once per learner message to actually write its reply.
 	let nudgedSinceUser = false;
 	let cutNudgedSinceUser = false; // "you were cut off mid-formula" sent since the learner's last message
-	let textQuizNudges = 0; // consecutive "re-ask that as a quiz" nudges (reset by a real quiz call)
-	let textProblemNudges = 0; // consecutive "pose that problem as a quiz_typed card" nudges (same reset)
-	pi.on("message_end", async (event) => {
+	let leadInNudgedSinceUser = false; // "you announced a question and stopped" sent since the learner's last message
+	let textQuizNudges = 0; // "re-ask that as a quiz" nudges since the learner's last message (also reset by a real quiz call)
+	let textProblemNudges = 0; // "pose that problem as a quiz_typed card" nudges (same resets)
+	const bounces = new Bounces(); // per-question bounce budgets for the gates below (reset per learner message)
+	let leakNudgedSinceUser = false; // "you just pasted the exercise's solution"
+	let lessonCodeNudgedSinceUser = false; // "your example uses untaught constructs"
+	pi.on("message_end", async (event, ctx) => {
 		const m: any = event.message;
 		if (m?.role === "user") {
 			nudgedSinceUser = false;
 			cutNudgedSinceUser = false;
+			leadInNudgedSinceUser = false;
+			leakNudgedSinceUser = false;
+			lessonCodeNudgedSinceUser = false;
+			textQuizNudges = textProblemNudges = 0;
+			bounces.reset();
 			return;
 		}
 		if (m?.role !== "assistant") return;
 		const hasToolCall = (m.content ?? []).some((b: any) => b?.type === "toolCall");
+		const said = textOf(m);
+		// The solution to the open exercise, pasted into chat: it can't be
+		// unsent, but the model must stop and switch to a parallel example.
+		if (!leakNudgedSinceUser && said.trim()) {
+			const branch = safeBranch(ctx);
+			const ex = openExercise(branch);
+			if (ex && leaksSolution(ex.referenceSolution, said)) {
+				leakNudgedSinceUser = true;
+				try {
+					get(ctx).store.addSignal({ subject: activeSubject, kind: "solution-leak", detail: String(ex.title ?? "").slice(0, 120) });
+				} catch {
+					// logging is best-effort
+				}
+				pi.sendMessage(
+					{
+						customType: "tutor-nudge",
+						content:
+							`STOP: your last message contains the solution (or nearly all of it) to the learner's open, graded exercise "${ex.title ?? ""}". Handing over the solution to graded work is never allowed, even when they ask. ` +
+							"Don't repeat or explain that code further. In your next message, tell the learner briefly to try it themselves first, then help with a hint or a worked PARALLEL example (a different problem using the same idea). " +
+							"If they really want the reference solution, the exercise card's Give up button shows it.",
+						display: false,
+					},
+					{ deliverAs: "followUp", triggerTurn: true },
+				);
+				return;
+			}
+		}
+		// Lesson examples may only use what's been taught (plus the construct the
+		// lesson is about): the code gate only sees tool arguments.
+		if (!lessonCodeNudgedSinceUser && activeSubject && said.includes("```")) {
+			const untaught = untaughtInLesson(ctx, said);
+			if (untaught.length) {
+				lessonCodeNudgedSinceUser = true;
+				pi.sendMessage(
+					{
+						customType: "tutor-nudge",
+						content:
+							`The code in your last message uses things the learner hasn't been taught yet: ${untaught.map((c) => c.label).join("; ")}. ` +
+							"Redo that example (say briefly that you're simplifying it) using only what they've been taught plus the one construct this lesson is about. If you were quoting the learner's own code, ignore this.",
+						display: false,
+					},
+					{ deliverAs: "followUp", triggerTurn: true },
+				);
+				return;
+			}
+		}
 		// A multiple-choice question typed into chat ("A) … B) … C) …") can't be
 		// clicked or graded: have the model ask it again through the quiz tool.
 		if (hasToolCall && (m.content ?? []).some((b: any) => b?.type === "toolCall" && QUIZ_TOOLS.has(b.name))) textQuizNudges = textProblemNudges = 0;
@@ -453,6 +596,21 @@ export default function tutor(pi: ExtensionAPI) {
 				{
 					customType: "tutor-nudge",
 					content: `Your last reply was cut off in the middle of a math expression; it ends with: «${tail}». Continue exactly where it stopped: start with the rest of that expression (closing its $), then finish the reply. Don't repeat anything you already wrote.`,
+					display: false,
+				},
+				{ deliverAs: "followUp", triggerTurn: true },
+			);
+			return;
+		}
+		// "Now let's test it:" and then the turn ends: the model announced a
+		// question or next step but stopped before making the call.
+		if (!hasToolCall && !leadInNudgedSinceUser && m.stopReason === "stop" && endsOnLeadIn(textOf(m))) {
+			leadInNudgedSinceUser = true;
+			const tail = textOf(m).trimEnd().slice(-80);
+			pi.sendMessage(
+				{
+					customType: "tutor-nudge",
+					content: `Your last reply ended with «${tail}» and then stopped, so the learner is still waiting for what you announced. Do it now: if it's a question or problem with a right answer, call quiz or quiz_typed right away; otherwise write the rest of the reply. Don't repeat or re-introduce anything you already wrote.`,
 					display: false,
 				},
 				{ deliverAs: "followUp", triggerTurn: true },
@@ -574,7 +732,7 @@ export default function tutor(pi: ExtensionAPI) {
 				sessions.unshift({ path: current, title: titleOf(name, ""), named: Boolean(name && !AUTO_NAME.test(name)), subject: activeSubject, modified: new Date().toISOString(), messages: 0, current: true });
 			}
 			sessions.sort((a, b) => b.modified.localeCompare(a.modified));
-			return { sessions, subjects: registry.list().map((s) => ({ name: s.name, lastUsed: s.lastUsed ?? s.createdAt })), activeSubject: activeSubject ?? null };
+			return { sessions, subjects: registry.list().map((s) => ({ name: s.name, lastUsed: s.lastUsed ?? s.createdAt, group: s.group ?? null })), groups: registry.groups(), activeSubject: activeSubject ?? null };
 		});
 
 		bridge.onApi("renameSession", async (body) => {
@@ -707,18 +865,25 @@ export default function tutor(pi: ExtensionAPI) {
 		}
 
 		let topicBlock = "";
+		let nextTopic = "";
 		if (activeSubject) {
 			const map = store.readTopicMap(activeSubject);
 			if (map?.topics.length) {
 				const links = store.loadLinks();
 				const onMap = new Set(map.topics.map((t) => t.id));
-				const untagged = store.conceptsForSubject(data, activeSubject).filter((c) => !store.effectiveTopic(c, links, onMap).topic);
+				const subjConcepts = store.conceptsForSubject(data, activeSubject);
+				const untagged = subjConcepts.filter((c) => !store.effectiveTopic(c, links, onMap).topic);
+				// The course's order is the teaching order: the first topic nothing covers yet.
+				const covered = new Set(subjConcepts.flatMap((c) => [store.effectiveTopic(c, links, onMap).topic, slug(c.name)]));
+				const next = map.topics.find((t) => !covered.has(t.id));
+				if (next) nextTopic = `${next.id}: ${next.title}${next.unit ? ` (${next.unit})` : ""}`;
 				topicBlock =
-					`\n\n### Course topic map (pass the id as \`topic\` for each concept in mark_taught)\n` +
+					`\n\n### Course topic map, in the order the course teaches it (pass the id as \`topic\` for each concept in mark_taught)\n` +
 					map.topics
 						.slice(0, 80)
-						.map((t) => `- ${t.id}: ${t.title}${t.unit ? ` (${t.unit})` : ""}`)
+						.map((t) => `- ${t.id}: ${t.title}${t.unit ? ` (${t.unit})` : ""}${covered.has(t.id) ? " ✓ taught" : ""}`)
 						.join("\n") +
+					(nextTopic ? `\nNext topic in course order: ${nextTopic}. Teach topics in this order unless the learner asks for something else.` : "") +
 					(untagged.length ? `\nConcepts not linked to a topic yet (link them with tag_concepts when convenient): ${untagged.slice(0, 15).map((c) => c.name).join(", ")}` : "");
 			} else if (subjFolders.length) {
 				topicBlock = `\n\nNo course topic map for ${activeSubject} yet. Build one soon (course_map_sources, then save_course_map) so the progress dashboard can show which parts of the course are covered.`;
@@ -734,32 +899,50 @@ export default function tutor(pi: ExtensionAPI) {
 			: "";
 		const subjectBlock = activeSubject
 			? `## Current subject: ${activeSubject}
-This session is for ${activeSubject}. Pass subject "${activeSubject}" to quiz, quiz_typed, mark_taught and assign_exercise. Concepts recorded so far: ${store.conceptIndex(data, activeSubject)}.${topicBlock}`
-			: "## Current subject: none\nNo subject selected (the learner can pick one with /home). Infer the subject from the conversation.";
+This session is for ${activeSubject}. Pass subject "${activeSubject}" to quiz, quiz_typed, mark_taught and assign_exercise. Concepts recorded so far: ${store.conceptIndex(data, activeSubject)}.
+
+### The learner's toolbox — the ONLY things they know in ${activeSubject}
+Assume the learner knows nothing about ${activeSubject} beyond the concepts recorded above. Not "the basics", not what most students would know by now: only what's recorded. Every worked example, quiz, practice problem and exercise must be solvable with those alone. Don't use any keyword, operator, method or idea outside the toolbox (in code: no loops, if, &&/||, ++, helper methods, arrays, String methods etc. until each one is taught). If a problem would need something new, pick a different problem, or teach the new thing first (introduce → explain → two worked examples → mark_taught). The tutor scans exercise and quiz code and refuses anything that uses untaught constructs. A concept leaves "unknown" only with evidence: you taught it, or the learner proved it (two confident, unaided, correct diagnostic answers on that one concept, at least one typed). A lesson's examples may use the construct the lesson is about, nothing else new.${topicBlock}`
+			: "## Current subject: none\nNo subject selected (the learner can pick one with /home). Ask which subject they're studying before any lesson, quiz or exercise; the first quiz, mark_taught or exercise files everything under the subject you pass.";
 
 		// Escape hatch: repeated misses on one concept, or frustration in the
-		// learner's own words → stop withholding and teach directly.
+		// learner's own words → stop withholding and teach directly. Scoped to
+		// this subject, and over once they get a check right.
 		const prompt = String(event.prompt ?? "");
 		const stuck = store.stuckState(data, activeSubject);
-		const frustrated = FRUSTRATION.test(prompt) && !prompt.startsWith("/");
-		if (frustrated) store.addSignal({ subject: activeSubject, kind: "frustration", detail: prompt.slice(0, 200) });
-		const recentDirect = store.recentSignals(data, 20).some((x) => x.kind === "asked-for-answer");
+		const distress = distressKind(prompt);
+		if (distress) store.addSignal({ subject: activeSubject, kind: "frustration", detail: prompt.slice(0, 200) });
+		const recentDirect = directSignals(data, activeSubject).length > 0;
+		// An open exercise is graded work: its solution is only ever shown by the card's Give up button.
+		const exercise = openExercise(ctx.sessionManager.getBranch() as any[]);
+		const homework = Boolean(distress) && GRADED_WORK.test(prompt);
 		let escape = "";
-		if (stuck || frustrated || recentDirect) {
-			const why = frustrated
-				? "the learner's message shows frustration or asks to just be told"
+		if (stuck || distress || recentDirect) {
+			const why = distress
+				? distress === "show"
+					? "the learner asks to just be shown"
+					: "the learner's message shows confusion or frustration"
 				: stuck
 					? `${stuck.misses} misses in a row on "${stuck.concept}"${stuck.hintsUsed ? ` even with ${stuck.hintsUsed} hint(s)` : ""}`
 					: "the learner asked to be shown";
-			if (stuck && !frustrated) store.addSignal({ subject: activeSubject, kind: "escape-hatch", detail: why });
-			const asked = frustrated || (recentDirect && !stuck);
+			if (stuck && !distress) store.addSignal({ subject: activeSubject, kind: "escape-hatch", detail: why });
+			const show = !exercise && !homework && (distress === "show" || (!distress && recentDirect && !stuck));
+			const parallel =
+				"Stop testing this idea and teach it directly, but don't solve their problem for them: walk through one fully worked example of a PARALLEL problem (same method, different numbers, function or program), then hand their own problem back for another try.";
 			escape = `\n\n## ESCAPE HATCH ACTIVE — ${why}
 ${
-	asked
-		? "They asked to be shown, so show them: explain the idea plainly and walk through the solution of the problem they're on (no more Socratic questions on this point), then give ONE easier check."
-		: "Stop testing this idea and teach it directly, but don't solve their problem for them: walk through one fully worked example of a PARALLEL problem (same method, different numbers or function), then hand their own problem back for another try. Offer to show their problem's full solution if they want it; show it only if they say yes."
+	show
+		? "They asked to be shown, so show them: explain the idea plainly and walk through the solution of the practice question they're on (no more Socratic questions on this point), then give ONE easier check."
+		: exercise
+			? `${parallel} They have an open exercise ("${exercise.title ?? "the current exercise"}"): never write its solution or code that solves it, even if they ask. If they want to see the reference solution, the exercise card's Give up button shows it.`
+			: homework
+				? `${parallel} This is their own graded coursework: never solve it or give its answer; teach the method on a different problem.`
+				: `${parallel} Offer to show their problem's full solution if they want it; show it only if they say yes.`
 } Acknowledge the difficulty briefly and warmly; don't lecture about effort. Return to the normal flow once they get a check right. (Strict withholding after genuine effort lowers learning; doing the work for them does too.)`;
 		}
+		// The exercises extension marks submits made under the escape hatch as assisted.
+		const g = globalThis as any;
+		g.__tutorEscape = escape ? { subject: activeSubject, since: g.__tutorEscape?.since ?? new Date().toISOString() } : undefined;
 
 		// Exams and due dates the learner has told us about.
 		const upcoming = store.upcomingAssessments(data, 21, activeSubject);
@@ -798,11 +981,11 @@ ${store.summary(data)}${assessments}${weekly}
 ${resources}
 
 ## Tutor rules
-- Teach first, then quiz. After you teach a concept (the teach loop's establish + connect steps), call mark_taught with the subject, the concept name(s), the \`approach\` you used (socratic, worked-example, direct, analogy, visual, code-first, practice-first) and a \`family\` for concepts that are easily confused with each other (e.g. "integration techniques", "convergence tests", "loop patterns"). quiz/quiz_typed with purpose "check", "review" or "checkpoint" are BLOCKED for concepts that weren't marked taught. Use purpose "diagnostic" to probe prior knowledge before teaching, and "discovery" for Socratic questions where they work out the concept you are about to establish.
+- Teach first, then quiz. Every new concept goes: introduce it → explain it in short chunks → two fully worked examples (headed **Example 1:** / **Example 2:**) → mark_taught → guided practice (quiz_typed with hints) → unaided check questions. Never quiz a learner on something they haven't been taught in this way; mark_taught is refused until the chat shows the explanation and the worked examples. After you teach a concept, call mark_taught with the subject, the concept name(s), the \`approach\` you used (socratic, worked-example, direct, analogy, visual, code-first, practice-first) and a \`family\` for concepts that are easily confused with each other (e.g. "integration techniques", "convergence tests", "loop patterns"). quiz/quiz_typed with purpose "check", "review" or "checkpoint" are BLOCKED for concepts that weren't marked taught. Use purpose "diagnostic" to probe prior knowledge before teaching, and "discovery" for Socratic questions where they work out the concept you are about to establish.
 - Personalise from evidence: follow the measured approach ranking above, but try a different approach about one time in four so the comparison stays honest. After explaining a concept, the learner can rate it (Clicked / Still fuzzy / Too fast / Too slow); adapt immediately to those ratings.
 - Explain-it-back: ask before you explain. Before explaining a result, a code output, a mistake or a step they just saw, have them explain it first (explain_back; quiz and quiz_typed do this automatically after a miss or a guess). Evaluate their explanation, fix the exact gap, call rate_explanation. Don't add explain-back to worked examples you are demonstrating.
-- Hint ladder, not answers: during practice give hints in steps (pass \`hints\` to quiz/quiz_typed: guiding question → technique → first step). Don't hand over a full solution while they are still attempting. After two genuine failed attempts or an exhausted ladder, teach with a worked PARALLEL example and hand their problem back (the escape hatch); show their own problem's solution only when they ask.
-- The learner does the work. Never solve the learner's problem for them unless they ask ("Show answer", "Just show me", or in words). Pose practice problems with quiz_typed (question = only the problem; method and identities in the hidden hints). When they answer partly right in chat, say exactly which part is right and ask for the next step; give at most one hint, not the rest of the solution. Don't put the method in the problem statement.
+- Hint ladder, not answers: during practice give hints in steps (pass \`hints\` to quiz/quiz_typed: guiding question → technique → first step). Don't hand over a full solution while they are still attempting. After two genuine failed attempts or an exhausted ladder, teach with a worked PARALLEL example and hand their problem back (the escape hatch); for a practice question, show its solution only when they ask.
+- The learner does the work. Never solve the learner's problem for them unless they ask about a practice question ("Show answer", "Just show me", or in words). Exercises (assign_exercise) and their own coursework are graded work: never write their solution or code that solves them, even if asked, even after "just show me" — give a worked PARALLEL example (a different problem, same idea) instead. The exercise card's Give up button is how they see the reference solution. Pose practice problems with quiz_typed (question = only the problem; method and identities in the hidden hints). When they answer partly right in chat, say exactly which part is right and ask for the next step; give at most one hint, not the rest of the solution. Don't put the method in the problem statement.
 - No-help checkpoints: every few lessons, and before any exam, run a checkpoint (/checkpoint, or quiz with purpose "checkpoint": no hints, no teaching between questions; explain afterwards). Only checkpoints prove mastery.
 - Interleave practice: when reviewing or practising concepts from the same family, mix them so the learner must first identify WHICH technique applies, then solve (/practice builds such sets). Never interleave definitions or reading — only problem types.
 - Confidence: confident misses are misconceptions — confront them with a contrasting example; feedback fixes them best, but they return within days without practice, so re-test them later in the session and at the next review. Correct guesses are not yet learned.
@@ -810,11 +993,16 @@ ${resources}
 - Successive relearning: a concept is solid after about three correct, spaced recalls across sessions, not one success today. Fade worked examples into problems as the learner succeeds.
 - Keep concept names stable and reuse them exactly (tutor_progress lists them). One concept = one idea the learner can be quizzed on.
 - Every question with a right answer goes through quiz or quiz_typed — never ask_user_question and never as plain chat text — so the learner is graded and sees the correct answer and explanation. Never reveal the answer in the question's details.
-- Every computable question (code output, arithmetic, calculus) gets a verify block so the key is checked by actually running it.
+- Every computable question (code output, arithmetic, calculus) gets a verify block so the key is checked by actually running it. When the learner questions a graded result, don't just agree: the quiz result shows the verified answer (what the program really prints); re-derive from it step by step, say plainly which of your statements was wrong if one was, and never invent a justification (e.g. calling 151 / 5 integer division when the result is 30.2).
 - Always end your turn with a visible message to the learner. Your reasoning is not shown as an answer; say the result, the correct answer, and the explanation in plain text.
-- Coding subjects: once a programming concept is taught and quiz-checked, have them write real code with assign_exercise (small, one new idea at a time). Then let them work; mentor through /submit and /hint, never hand over the solution.
+- Coding subjects: once a programming concept is taught and quiz-checked, have them write real code with assign_exercise (small, one new idea at a time). Assign an exercise only after the concept has at least one correct check (guided practice, then a check). Then let them work; mentor through /submit and /hint, never hand over the solution. Only assign_exercise creates and opens the learner's file: never write an exercise or a code skeleton for it as chat text (the learner writes the whole program from scratch, imports, class and main included), and never say a file is created or open unless assign_exercise just succeeded. If it was refused, fix the problem and call it again.
 - Math: write ALL math in LaTeX ($...$ inline, $$...$$ display) — in chat and in every quiz field (question, options, hints, explanation). Never plain text like e^tan(x) * sec^2(x); write $e^{\\tan x}\\sec^2 x$. Plain-text math in a quiz is rejected.
-- If the learner left a note on a quiz answer, answer it directly before the next question (the next quiz is blocked until you do).
+- If the learner left a note on a quiz answer, answer it directly (refer to what they wrote) before the next question (the next quiz is blocked until you do).
+- When the learner skips a quiz or exercise card, don't assign another exercise or start another quiz on your own: ask what they'd like to do (ask_user_question) or reply in text. The next card is blocked until they ask for one.
+- Never tell the learner they've "mastered" something. Mastery comes from no-help checkpoints and spaced reviews, shown on the progress dashboard; after a correct answer say what they got right and what comes next.
+- Diagnostics: tag each diagnostic question with exactly ONE concept, the one it tests. A single right answer proves nothing; "known" takes two confident, unaided, correct diagnostics on that concept (at least one quiz_typed). At most ${MAX_PROBES} probes per concept per session, then teach.
+- Course order: when a course topic map exists, pass \`topic\` (a map id) for every concept in mark_taught, and teach the next topic in course order; mark_taught for a later topic is refused unless the learner asked for it.
+- TutorBot can't run shell commands or read, write or edit files. To look at a learner's program, use assign_exercise with existingFile.
 - When items are due for review, offer a short review (/review) at the start of a session, before new material.
 - When the learner mentions an upcoming exam, quiz, or deadline, record it with set_assessment.
 - TutorBot supplements the course; it doesn't replace it. Every few sessions, remind them to do the real coursework too (assigned homework, past exams, office hours). Never do their current graded homework for them; use past and practice material as style models.
@@ -822,18 +1010,30 @@ ${resources}
 		return { systemPrompt: event.systemPrompt + block };
 	});
 
-	// ── Gates: unanswered note, teach-first ──────────────────────────────────
-	let mathBounces = 0;
-	let repeatBounces = 0;
+	// ── Gates ────────────────────────────────────────────────────────────────
+	let guided = { start: -1, n: 0 }; // guided-practice bounces in the current lesson window
 	pi.on("tool_call", async (event, ctx) => {
 		const input = event.input as any;
+		const tool = event.toolName;
+
+		// TutorBot never runs commands or touches files, whatever tools the
+		// launcher left enabled. The learner's files are theirs.
+		if (BLOCKED_BUILTINS.has(tool)) {
+			return {
+				block: true,
+				reason:
+					"TutorBot can't run commands or touch files; that isn't part of tutoring here. Teach in chat, check computable answers with a quiz `verify` block, and give coding practice with assign_exercise " +
+					"(pass existingFile to turn a program the learner wrote into an exercise). Don't tell the learner you ran or opened anything.",
+			};
+		}
 
 		// Math must be LaTeX so it renders typeset, not as "e^tan(x) * sec^2(x)".
-		if (MATH_TOOLS.has(event.toolName)) {
+		// Not for programming subjects: there `i <= 4` is code, and bouncing it
+		// made the model rewrite Java into `i \le 4`.
+		if (MATH_TOOLS.has(tool) && !subjectLanguage(String(activeSubject ?? input.subject ?? ""))) {
 			repairInputMath(input);
 			const plain = [...new Set(displayedFields(input).flatMap(findPlainMath))].slice(0, 6);
-			if (plain.length && mathBounces < MAX_MATH_BOUNCES) {
-				mathBounces++;
+			if (plain.length && bounces.take("math", questionKey(String(input.question ?? input.prompt ?? "")), MAX_MATH_BOUNCES)) {
 				return {
 					block: true,
 					reason:
@@ -843,14 +1043,19 @@ ${resources}
 						"Keep the explanation's `Answer:` line identical to the option label. Code stays in backticks.",
 				};
 			}
-			mathBounces = 0;
 		}
 
-		// With a subject selected, always file progress under its exact name
-		// (models drift: "Calculis II" vs "Calc II" would split the record).
-		if (activeSubject && SUBJECT_TOOLS.has(event.toolName)) input.subject = activeSubject;
+		// Progress is always filed under a subject: the selected one (models drift:
+		// "Calculis II" vs "Calc II" would split the record), else the one passed
+		// or last studied. Without one the toolbox in the prompt is empty.
+		if (SUBJECT_TOOLS.has(tool)) {
+			if (!activeSubject && !adoptSubject(ctx, String(input.subject ?? ""))) {
+				return { block: true, reason: "No subject is selected. Ask the learner which subject they're studying (or to pick one with /home), then pass it as `subject`." };
+			}
+			input.subject = activeSubject;
+		}
 
-		if (event.toolName === "ask_user_question" && looksLikeKnowledgeCheck(String(input.question ?? ""), input.details)) {
+		if (tool === "ask_user_question" && looksLikeKnowledgeCheck(String(input.question ?? ""), input.details)) {
 			return {
 				block: true,
 				reason:
@@ -860,12 +1065,35 @@ ${resources}
 			};
 		}
 
+		// The answer key must not be on the card before they answer.
+		if (QUIZ_TOOLS.has(tool)) {
+			const leak = quizKeyLeak(tool, input);
+			if (leak && bounces.take("key", questionKey(String(input.question ?? "")), 2)) {
+				return {
+					block: true,
+					reason:
+						`The learner would see the answer before answering: ${leak}. Hints guide toward the method (what to notice, which rule, the first step), never the answer; details and the question give context, never the key or an "example answer" that is the answer. ` +
+						"Rewrite those fields and call again; the full answer belongs only in `explanation`.",
+				};
+			}
+		}
+		if (tool === "assign_exercise") {
+			const lines = hintsWithSolutionLines(input.hints, input.referenceSolution);
+			if (lines.length) {
+				return {
+					block: true,
+					reason:
+						`The hints contain line(s) of the reference solution (${lines.slice(0, 3).map((l) => `\`${l}\``).join(", ")}), which hands over the graded answer. ` +
+						"Rewrite the hints as a ladder that guides without code that solves it: a guiding question → the technique → a first concrete step in words. Nothing was assigned; call assign_exercise again.",
+				};
+			}
+		}
+
 		// A just-missed question can't be re-asked right away: ask a variant.
-		if (QUIZ_TOOLS.has(event.toolName) && typeof input.question === "string") {
+		if (QUIZ_TOOLS.has(tool) && typeof input.question === "string") {
 			const key = questionKey(input.question);
 			const early = pendingRetests(sessionQuestions(ctx.sessionManager.getBranch() as any[])).find((p) => p.since < RETEST_GAP && sameQuestion(p.miss.key, key));
-			if (early && repeatBounces < MAX_REPEAT_BOUNCES) {
-				repeatBounces++;
+			if (early && bounces.take("repeat", key, MAX_REPEAT_BOUNCES)) {
 				return {
 					block: true,
 					reason:
@@ -874,53 +1102,313 @@ ${resources}
 						`The original question comes back as a delayed re-test after ${RETEST_GAP} other questions.`,
 				};
 			}
-			repeatBounces = 0;
 		}
 
-		if (!GATED_TOOLS.has(event.toolName)) return;
+		// Teach-first, part 1: "taught" has to mean the learner saw a lesson, in course order.
+		if (tool === "mark_taught") {
+			const { store } = get(ctx);
+			const data = store.loadProgress();
+			const subject = String(input.subject ?? "").trim();
+			const items: any[] = Array.isArray(input.concepts) ? input.concepts : [];
+			const nameOf = (c: any) => String(c?.name ?? c ?? "").trim();
+			const names: string[] = items.map(nameOf).filter(Boolean);
+			// Exact names (or plural/"-basics" variants) only: "nested loops" is not "loops".
+			const fresh = names.filter((n) => !store.findConceptStrict(data, subject, n));
+			if (fresh.length > MAX_NEW_CONCEPTS_PER_LESSON) {
+				return {
+					block: true,
+					reason:
+						`mark_taught records what the learner was just taught, not a syllabus. ${fresh.length} new concepts at once (${fresh.join(", ")}) can't all have been taught. ` +
+						`Teach ONE concept now (introduce → explain → ${MIN_WORKED_EXAMPLES} worked examples), then mark just that one. (Concepts the learner proved with diagnostics are already recorded and don't count.)`,
+				};
+			}
+			const branchNow = ctx.sessionManager.getBranch() as any[];
+			const userText = lastUserText(branchNow);
+			const order = courseOrder(store, data, subject);
+			if (order && fresh.length) {
+				const topicOf = (t: unknown) => (t ? order.topics.find((x) => x.id === slug(String(t)) || slug(x.title) === slug(String(t))) : undefined);
+				const lacking: string[] = [];
+				for (const it of items) {
+					if (!fresh.includes(nameOf(it)) || typeof it !== "object") continue;
+					const t = topicOf(it.topic);
+					if (t) it.topic = t.id;
+					else lacking.push(nameOf(it));
+				}
+				if (lacking.length) {
+					return {
+						block: true,
+						reason:
+							`This course has a topic map, so every new concept needs \`topic\`: the id of the course topic it belongs to. Missing or not on the map for: ${lacking.join(", ")}. ` +
+							`Topic ids in course order: ${order.topics.slice(0, 60).map((t) => `${t.id} (${t.title})${order.covered.has(t.id) ? " ✓" : ""}`).join("; ")}.`,
+					};
+				}
+				if (order.next) {
+					const nextIdx = order.index(order.next.id);
+					const ahead = items.filter((it) => fresh.includes(nameOf(it)) && order.index(it.topic) > nextIdx).map((it) => ({ name: nameOf(it), topic: topicOf(it.topic)! }));
+					const unasked = ahead.filter((a) => !askedForTopic(userText, a.topic));
+					if (unasked.length) {
+						return {
+							block: true,
+							reason:
+								`Course order: the next topic in this course is "${order.next.id}: ${order.next.title}", but ${unasked.map((a) => `"${a.name}" is in the later topic "${a.topic.id}: ${a.topic.title}"`).join("; ")}. ` +
+								"The learner follows the professor's order, so teach the next topic first (or record this concept under the topic it really belongs to). Jump ahead only when the learner asks for that topic.",
+						};
+					}
+				}
+			}
+			if (fresh.length) {
+				const gap = unmasteredPrevious(data, subject);
+				if (gap && !MOVE_ON_REQUEST.test(userText)) {
+					return {
+						block: true,
+						reason:
+							`Not yet: the learner hasn't mastered "${gap.name}" (${gap.streak} of ${MASTERY_STREAK} unaided correct checks in a row; ${gap.checks} check${gap.checks === 1 ? "" : "s"} so far). ` +
+							`Before starting a new concept, keep practising "${gap.name}" with NEW problems (purpose "check", tagged "${gap.name}"; unaided means no hints, not a guess, right first try). ` +
+							"If they keep missing, re-teach it a different way with another worked example instead of moving on. Only move on early if the learner asks to (e.g. \"let's move on\").",
+					};
+				}
+				const lesson = lessonSinceLastMark(branchNow);
+				const missing = lessonGaps(lessonEvidence(lesson.text, fresh));
+				if (missing.length) {
+					return {
+						block: true,
+						reason:
+							`Not recorded: the learner hasn't been taught ${fresh.join(", ")} yet in this conversation. Before mark_taught, the chat since the last mark_taught must contain ${missing.join(" and ")}. ` +
+							"Teach it now in a normal message: (1) introduce it and connect it to what they know, (2) explain it in short chunks, (3) work the examples step by step, the second one different from the first. Then call mark_taught and check with a NEW problem. " +
+							"If the learner says they already know it, prove it: two diagnostic questions on just this concept (one quiz_typed), answered confidently and correctly without hints, record it as known.",
+					};
+				}
+			}
+		}
 
-		// 1) Has the agent replied to the note left on the previous quiz?
+		// Probe questions: one concept each, and a few at most, then teach.
+		if (QUIZ_TOOLS.has(tool) && PROBE_PURPOSES.has(input.purpose)) {
+			const concepts: string[] = Array.isArray(input.concepts) ? input.concepts.map(String) : [];
+			if (input.purpose === "diagnostic" && concepts.length > 1) {
+				return {
+					block: true,
+					reason: `A diagnostic question tests ONE concept, so tag it with exactly one (the one a right answer would show they know), not ${concepts.length}. Call again with concepts: ["<that concept>"].`,
+				};
+			}
+			const branch = ctx.sessionManager.getBranch() as any[];
+			const lesson = lessonSinceLastMark(branch);
+			const sinceUser = probesSinceUser(branch);
+			const overdone = concepts.find((c) => probesOn(branch, c) >= MAX_PROBES);
+			if (lesson.probes >= MAX_PROBES || sinceUser >= MAX_PROBES || overdone) {
+				return {
+					block: true,
+					reason:
+						`${overdone ? `"${overdone}" has already been probed ${MAX_PROBES} times this session` : `The learner has answered ${Math.max(lesson.probes, sinceUser)} diagnostic/discovery questions without a lesson since`}. That's enough probing: you know where they stand. ` +
+						"Teach now — introduce the next concept, explain it, work 2 labelled examples — then mark_taught and check. Don't quiz on material they haven't been taught.",
+				};
+			}
+		}
+
+		// Elaborated feedback: the explanation shown after an answer must say why.
+		if (
+			QUIZ_TOOLS.has(tool) &&
+			input.purpose !== "diagnostic" &&
+			typeof input.explanation === "string" &&
+			explanationReasoning(input.explanation) < MIN_EXPLANATION_REASONING &&
+			bounces.take("feedback", questionKey(String(input.question ?? "")), 2)
+		) {
+			return {
+				block: true,
+				reason:
+					"The explanation is what the learner reads after answering, and feedback that explains WHY works about twice as well as just giving the answer. " +
+					"Rewrite `explanation` as a short worked solution: the key idea, the steps (in LaTeX), and why the most tempting wrong option is wrong. End with the `Answer:` line. Then call again.",
+			};
+		}
+
+		// Guided practice first: the first graded question after a lesson (any
+		// purpose: check, review or checkpoint) is a "check" with a hint ladder,
+		// so the learner can succeed with support before being tested unaided.
+		if (QUIZ_TOOLS.has(tool) && !PROBE_PURPOSES.has(input.purpose)) {
+			const lesson = lessonSinceLastMark(ctx.sessionManager.getBranch() as any[]);
+			const purpose = input.purpose ?? "check";
+			const hinted = Array.isArray(input.hints) && input.hints.some((h: any) => String(h ?? "").trim());
+			if (lesson.marked && lesson.checks === 0 && (purpose !== "check" || !hinted)) {
+				if (guided.start !== lesson.start) guided = { start: lesson.start, n: 0 };
+				if (guided.n < MAX_GUIDED_BOUNCES) {
+					guided.n++;
+					return {
+						block: true,
+						reason:
+							"This is the learner's first question right after the lesson, so make it guided practice: purpose \"check\" (a review or checkpoint comes later), the same kind of problem as the worked examples (new numbers), " +
+							"with a `hints` ladder of 2–3 steps (1: what to notice / which rule, 2: the setup or first step, 3: the next step). Prefer quiz_typed. Then call again.",
+					};
+				}
+			}
+		}
+
+		if (!GATED_TOOLS.has(tool)) return;
 		const branch = ctx.sessionManager.getBranch() as any[];
+
+		// 1) They just skipped a card: don't push another one at them unasked.
+		const skipped = skippedSinceUser(branch);
+		if (skipped) {
+			return {
+				block: true,
+				reason:
+					`The learner just skipped that ${skipped === "assign_exercise" ? "exercise" : "question"}. Don't hand them another ${tool === "assign_exercise" ? "exercise" : "question"} they didn't ask for. ` +
+					"Reply briefly and ask what they'd like to do next (ask_user_question with a few options, e.g. an easier one, more explanation, something else, or a break). Assign or quiz again only when they ask.",
+			};
+		}
+
+		// 2) Has the agent replied to the note left on the previous quiz?
+		let replies = "";
 		for (let i = branch.length - 1; i >= 0; i--) {
 			const m = branch[i]?.message;
 			if (!m) continue;
 			if (m.role === "user") break;
-			if (m.role === "assistant" && textOf(m).trim().length >= 40) break;
+			if (m.role === "assistant") replies = `${textOf(m)}\n${replies}`;
 			// Skip blocked/unavailable quiz results: only an answered question can carry a note.
 			if (m.role === "toolResult" && QUIZ_TOOLS.has(m.toolName) && m.details?.status === "answered") {
 				const note = m.details?.note;
-				if (note) {
+				if (note && !noteAddressed(String(note), replies)) {
 					return {
 						block: true,
-						reason: `The learner left a note on the previous question that you haven't answered: "${note}". Reply to it directly in a normal message first (explain, answer their question, or adjust), then continue.`,
+						reason: `The learner left a note on the previous question that you haven't answered: "${note}". Reply to it directly in a normal message first (refer to what they wrote: explain, answer their question, or adjust), then continue.`,
 					};
 				}
 				break;
 			}
 		}
 
-		// 2) Teach-first: every concept in a check/review question (or exercise) must be taught.
-		const purpose: QuizPurpose = event.toolName === "assign_exercise" ? "check" : (input.purpose ?? "check");
-		if (purpose === "diagnostic" || purpose === "discovery") return;
+		// 3) Teach-first: every concept in a check/review question (or exercise) must be taught.
+		const purpose: QuizPurpose = tool === "assign_exercise" ? "check" : (input.purpose ?? "check");
+		if (PROBE_PURPOSES.has(purpose)) return;
 		const subject = String(input.subject ?? "").trim();
-		const concepts: string[] = Array.isArray(input.concepts) ? input.concepts : [];
+		const concepts: string[] = Array.isArray(input.concepts) ? input.concepts.map(String) : [];
 		if (!subject || !concepts.length) {
 			return { block: true, reason: "Pass subject and concepts so the tutor can track progress and check the concepts were taught." };
 		}
 		const { store } = get(ctx);
 		const data = store.loadProgress();
-		const missing = concepts.filter((c) => !store.findConcept(data, subject, c));
+		const missing = concepts.filter((c) => !store.findConceptStrict(data, subject, c));
 		if (missing.length) {
 			return {
 				block: true,
 				reason:
 					`Not taught yet in "${subject}": ${missing.join(", ")}. The learner asked to be taught before being quizzed. ` +
-					`Teach it first (motivate → establish → connect), call mark_taught, then quiz. If you DID teach it under another name, reuse that exact name. ` +
+					`Teach it first (introduce → explain → two worked examples), call mark_taught, then guided practice, then quiz. If you DID teach it under another name, reuse that exact name; a different name ("nested loops" vs "loops") is a different concept that needs its own lesson. ` +
 					`Concepts recorded for ${subject}: ${store.conceptIndex(data, subject)}. ` +
-					`(To probe prior knowledge before teaching, use purpose "diagnostic".)`,
+					`(To probe prior knowledge before teaching, use purpose "diagnostic" with one concept.)`,
+			};
+		}
+
+		// 4) An exercise comes after the learner got a check on it right.
+		if (tool === "assign_exercise" && !input.existingFile) {
+			const unchecked = concepts.filter((c) => !hasCorrectCheck(data, subject, c));
+			if (unchecked.length) {
+				return {
+					block: true,
+					reason:
+						`Not yet: ${unchecked.join(", ")} has no correct check question yet. Before writing code on their own the learner needs guided practice (quiz_typed with hints) and at least one correct check on it. ` +
+						"Nothing was assigned and no file was created; don't tell the learner a file is ready.",
+				};
+			}
+		}
+
+		// 5) Teach-first, in the code: the tags can say "string-basics" while the
+		// solution needs a for loop and ||. Check what the code itself relies on.
+		const untaught = untaughtInCode(tool, input, subject, store, data);
+		if (untaught.length) {
+			const map = store.readTopicMap(subject)?.topics ?? [];
+			const list = untaught.map((c) => {
+				const t = topicFor(c, map);
+				return `${c.label}${t ? ` (course topic "${t.id}": ${t.title})` : ""}`;
+			});
+			const what = tool === "assign_exercise" ? "This exercise's reference solution" : "The code in this question";
+			return {
+				block: true,
+				reason:
+					`${what} uses things the learner hasn't been taught yet: ${list.join("; ")}. The learner only knows what's been taught, so they'd be stuck or guessing. ` +
+					`Either (a) redesign it so it can be solved with only what they've been taught (${store.conceptIndex(data, subject)}), or (b) if they're ready for the next topic in course order, teach it first: introduce → explain → two worked examples → mark_taught (with its course topic), then guided practice. ` +
+					`If the learner says they already know it, prove it with diagnostics first (two on that one concept, one typed). ` +
+					(tool === "assign_exercise" ? "Nothing was assigned and no file was created or opened: call assign_exercise again with the redesigned exercise, and never tell the learner a file is ready unless assign_exercise succeeded." : ""),
 			};
 		}
 	});
+
+	// Adopt a subject when none is selected: the one the model passed, else the
+	// last one studied. Tags the session so the toolbox shows from now on.
+	function adoptSubject(ctx: any, wanted: string): string | undefined {
+		const { registry } = get(ctx);
+		const g = globalThis as any;
+		const w = wanted.trim();
+		let name: string | undefined;
+		if (w) name = registry.has(w) ? registry.resolve(w) : registry.ensure(w).name;
+		else if (g.__tutorLastSubject && registry.has(g.__tutorLastSubject)) name = registry.resolve(g.__tutorLastSubject);
+		else name = registry.list()[0]?.name;
+		if (!name) return undefined;
+		activeSubject = name;
+		g.__tutorLastSubject = name;
+		pi.appendEntry(SUBJECT_ENTRY, { subject: name });
+		getBridge().setState("subject", name);
+		showSubjectStatus(ctx);
+		return name;
+	}
+
+	// Code snippets in markdown worth scanning (constructs.scanText when available).
+	function codeSnippets(text: string, fallback: CodeLanguage | undefined): { code: string; language: CodeLanguage }[] {
+		const scan = (Constructs as any).scanText;
+		if (typeof scan === "function") {
+			try {
+				return scan(text, fallback) ?? [];
+			} catch {
+				// fall back to fenced blocks
+			}
+		}
+		return fencedCode(text, fallback);
+	}
+
+	// Untaught constructs in a lesson's code. Allowed beyond the toolbox: the
+	// concept the current lesson recorded, the next topic in course order, and
+	// whatever the lesson names in a heading or in bold (what it's about).
+	function untaughtInLesson(ctx: any, text: string): Construct[] {
+		if (!activeSubject) return [];
+		const snippets = codeSnippets(text, subjectLanguage(activeSubject));
+		if (!snippets.length) return [];
+		const { store } = get(ctx);
+		const data = store.loadProgress();
+		const order = courseOrder(store, data, activeSubject);
+		const links = store.loadLinks();
+		const known: { name: string; topic?: string }[] = store.conceptsForSubject(data, activeSubject).map((c) => ({ name: c.name, topic: store.effectiveTopic(c, links).topic }));
+		for (const n of lessonSinceLastMark(safeBranch(ctx)).taught) known.push({ name: n });
+		if (order?.next) known.push({ name: order.next.title, topic: order.next.id });
+		const named = [...text.matchAll(/^#{1,6}[ \t]+(.+)$|\*\*([^*\n]+)\*\*/gm)].map((m) => m[1] ?? m[2]).join("\n");
+		const seen = new Map<string, Construct>();
+		for (const s of snippets) for (const c of untaughtConstructs(s.code, s.language, known, order?.topics ?? [])) if (!c.words.test(named)) seen.set(c.id, c);
+		return [...seen.values()];
+	}
+
+	// Constructs the exercise / quiz code uses that no recorded concept covers.
+	function untaughtInCode(tool: string, input: any, subject: string, store: TutorStore, data: any): Construct[] {
+		const fallback = subjectLanguage(subject);
+		const snippets: { code: string; language: CodeLanguage }[] = [];
+		if (tool === "assign_exercise") {
+			// The learner's own program shows what they can already use.
+			if (input.existingFile) return [];
+			const lang = ["java", "python", "javascript"].includes(input.language) ? (input.language as CodeLanguage) : fallback;
+			// Separately: joined, the two `public class Main`s would read as "defines classes".
+			if (lang) for (const code of [input.referenceSolution]) if (typeof code === "string" && code.trim()) snippets.push({ code, language: lang });
+		} else {
+			// What the learner sees while answering (the explanation comes after).
+			for (const text of displayedFields({ ...input, explanation: undefined })) {
+				snippets.push(...fencedCode(text, fallback));
+				const inline = [...text.replace(/```[\s\S]*?```/g, "").matchAll(/`([^`\n]+)`/g)].map((m) => m[1]).join("\n");
+				if (inline && fallback) snippets.push({ code: inline, language: fallback });
+			}
+		}
+		if (!snippets.length) return [];
+		const map = store.readTopicMap(subject)?.topics ?? [];
+		const links = store.loadLinks();
+		const known = store.conceptsForSubject(data, subject).map((c) => ({ name: c.name, topic: store.effectiveTopic(c, links).topic }));
+		const seen = new Map<string, Construct>();
+		for (const s of snippets) for (const c of untaughtConstructs(s.code, s.language, known, map)) seen.set(c.id, c);
+		return [...seen.values()];
+	}
 
 	// ── Recording ────────────────────────────────────────────────────────────
 	pi.on("tool_result", async (event, ctx) => {
@@ -984,6 +1472,7 @@ ${resources}
 			hintsUsed: Number(d.hintsUsed) || 0,
 			attempts: Number(d.attempts) > 1 ? Number(d.attempts) : undefined,
 			selfExplanation: d.selfExplanation,
+			toolCallId: (event as any).toolCallId,
 		};
 		if (d.wantsDirect) store.addSignal({ subject: record.subject, kind: "asked-for-answer", detail: record.question.slice(0, 120) });
 		try {
@@ -1000,7 +1489,8 @@ ${resources}
 		description:
 			"Record that you have just taught one or more concepts (motivated, established and connected them). Required before quizzing on them with purpose check/review. Also creates their spaced-review schedule.",
 		promptSnippet: "Record concepts you have just taught (required before quizzing on them).",
-		prepareArguments: (args: any) => coerceJsonArgs(args, ["concepts"]),
+		// Models send concepts as plain strings ("loops") or a JSON string of them.
+		prepareArguments: (args: any) => coerceList(coerceJsonArgs(args, ["concepts"]), "concepts", "name"),
 		parameters: Type.Object({
 			subject: Type.String({ description: 'Subject/course, stable across sessions (e.g. "Java", "Calc II").' }),
 			concepts: Type.Array(
@@ -1024,10 +1514,14 @@ ${resources}
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
 			const { store } = get(ctx);
+			// Fresh = newly recorded. Only a mark_taught with fresh concepts starts
+			// a new lesson window (probe count, guided practice).
+			const before = store.loadProgress();
+			const fresh = params.concepts.filter((c) => !store.findConceptStrict(before, params.subject, c.name)).map((c) => c.name);
 			const saved = store.markTaught(params.subject, params.concepts, params.approach as Approach | undefined);
 			return {
-				content: [{ type: "text", text: `Recorded as taught in ${params.subject}${params.approach ? ` (${params.approach})` : ""}: ${saved.map((c) => c.name).join(", ")}. Now quiz-check them.` }],
-				details: { subject: params.subject, concepts: saved.map((c) => c.name), approach: params.approach },
+				content: [{ type: "text", text: `Recorded as taught in ${params.subject}${params.approach ? ` (${params.approach})` : ""}: ${saved.map((c) => c.name).join(", ")}. Now guided practice (quiz_typed with hints), then unaided checks.` }],
+				details: { subject: params.subject, concepts: saved.map((c) => c.name), fresh, approach: params.approach },
 			};
 		},
 	});
@@ -1102,13 +1596,16 @@ ${resources}
 	pi.registerTool({
 		name: "resolve_dispute",
 		label: "resolve_dispute",
-		description: "Settle the learner's most recent disputed quiz_typed answer after judging it on substance. Updates their progress accordingly.",
+		description: "Settle the learner's most recent disputed quiz_typed answer (this session, this subject) after judging it on substance. Updates their progress accordingly; a settled dispute never counts as checkpoint proof.",
 		parameters: Type.Object({
 			verdict: Type.Union([Type.Literal("correct"), Type.Literal("incorrect")]),
 			reason: Type.String({ description: "One sentence: why." }),
 		}),
 		async execute(_id, params, _signal, _onUpdate, ctx) {
-			const rec = get(ctx).store.resolveDispute(params.verdict);
+			// The dispute from this session's latest disputed card, in this subject only.
+			const branch = safeBranch(ctx);
+			const disputed = [...branch].reverse().find((e) => e?.message?.role === "toolResult" && e.message.toolName === "quiz_typed" && e.message.details?.disputed)?.message;
+			const rec = get(ctx).store.resolveDispute(params.verdict, { subject: activeSubject, toolCallId: disputed?.toolCallId });
 			const text = rec ? `Recorded the disputed answer as ${params.verdict}.` : "No disputed answer was pending.";
 			return { content: [{ type: "text", text }], details: { verdict: params.verdict, reason: params.reason } };
 		},
@@ -1795,18 +2292,98 @@ ${resources}
 				return;
 			}
 
+			// Subject folders: create, file subjects into, rename, delete.
+			const organize = async () => {
+				const NEWF = "New folder…";
+				const MOVE = "Move a subject into a folder…";
+				const OUT = "Take a subject out of its folder…";
+				const RENF = "Rename a folder…";
+				const DELF = "Delete a folder (its subjects stay)…";
+				const BACK = "Back";
+				const groups = registry.groups();
+				const filed = registry.list().filter((s) => s.group);
+				const pick = await ctx.ui.select("Subject folders — group your subjects (e.g. by semester or school)", [
+					NEWF,
+					...(registry.list().length ? [MOVE] : []),
+					...(filed.length ? [OUT] : []),
+					...(groups.length ? [RENF, DELF] : []),
+					BACK,
+				]);
+				try {
+					if (pick === NEWF) {
+						const n = (await ctx.ui.input("Name of the new folder", "e.g. Fall 2026, NYU, Personal"))?.trim();
+						if (n) ctx.ui.notify(`Created folder ${registry.createGroup(n)}.`, "info");
+					} else if (pick === MOVE) {
+						const subj = await ctx.ui.select("Move which subject?", registry.list().map((s) => s.name));
+						if (!subj) return;
+						const NEWHERE = "New folder…";
+						let to = await ctx.ui.select(`Move ${subj} into which folder?`, [...groups, NEWHERE]);
+						if (to === NEWHERE) to = (await ctx.ui.input("Name of the new folder", "e.g. Fall 2026"))?.trim();
+						if (to) ctx.ui.notify(`${subj} is now in ${registry.setGroup(subj, to).group}.`, "info");
+					} else if (pick === OUT) {
+						const subj = await ctx.ui.select("Take which subject out of its folder?", filed.map((s) => `${s.name} (in ${s.group})`));
+						const s = filed.find((x) => `${x.name} (in ${x.group})` === subj);
+						if (s) ctx.ui.notify(`${registry.setGroup(s.name, undefined).name} is no longer in a folder.`, "info");
+					} else if (pick === RENF) {
+						const from = await ctx.ui.select("Rename which folder?", groups);
+						const to = from && (await ctx.ui.input(`New name for ${from}`, from))?.trim();
+						if (from && to && to !== from) ctx.ui.notify(`Renamed folder ${from} to ${registry.renameGroup(from, to)}.`, "info");
+					} else if (pick === DELF) {
+						const name = await ctx.ui.select("Delete which folder? Its subjects move out of it; nothing else is deleted.", groups);
+						if (name) {
+							const n = registry.deleteGroup(name);
+							ctx.ui.notify(`Deleted folder ${name}${n ? `; its ${n} subject${n === 1 ? "" : "s"} moved to the top level` : ""}.`, "info");
+						}
+					}
+				} catch (e) {
+					ctx.ui.notify((e as Error).message, "error");
+				}
+			};
+
+			let inFolder: string | undefined; // the folder being browsed, if any
 			while (true) {
-				const subjects = registry.list();
 				const NEW = "Start a new subject";
 				const CHAT = "Just chat (no subject)";
 				const isCurrent = (name: string) => activeSubject !== undefined && slug(name) === slug(activeSubject);
 				const RENAME = "Rename a subject…";
+				const ORGANIZE = "Organize subject folders…";
+				const BACK = "Back";
+				const groups = inFolder === undefined ? registry.groups() : [];
+				// At the top: folders first, then subjects in no folder. Inside a folder: its subjects.
+				const subjects = registry.inGroup(inFolder);
+				const folderLabel = (g: string) => {
+					const n = registry.inGroup(g).length;
+					return `📁 ${g} (${n} subject${n === 1 ? "" : "s"})`;
+				};
+				const folderLabels = groups.map(folderLabel);
 				const labels = subjects.map((s) => `${s.name}${isCurrent(s.name) ? "  (current)" : ""}`);
-				const title = activeSubject ? `TutorBot Home — currently studying ${activeSubject}` : "TutorBot Home — what are we studying?";
-				const choice = await ctx.ui.select(title, [...labels, NEW, ...(subjects.length ? [RENAME] : []), CHAT]);
+				const title =
+					inFolder !== undefined
+						? `📁 ${inFolder}`
+						: activeSubject
+							? `TutorBot Home — currently studying ${activeSubject}`
+							: "TutorBot Home — what are we studying?";
+				const options =
+					inFolder !== undefined
+						? [...labels, BACK]
+						: [...folderLabels, ...labels, NEW, ...(registry.list().length ? [RENAME, ORGANIZE] : []), CHAT];
+				const choice = await ctx.ui.select(title, options);
 				if (!choice) return;
+				if (choice === BACK) {
+					inFolder = undefined;
+					continue;
+				}
+				const folderIdx = folderLabels.indexOf(choice);
+				if (folderIdx >= 0) {
+					inFolder = groups[folderIdx];
+					continue;
+				}
+				if (choice === ORGANIZE) {
+					await organize();
+					continue;
+				}
 				if (choice === RENAME) {
-					await renameFromHome(subjects.map((s) => s.name));
+					await renameFromHome(registry.list().map((s) => s.name));
 					continue;
 				}
 				if (choice === CHAT) {

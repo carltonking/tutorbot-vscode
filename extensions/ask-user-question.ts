@@ -1,7 +1,7 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 import { getBridge } from "./lib/bridge.ts";
-import { coerceJsonArgs } from "./lib/coerce.ts";
+import { coerceJsonArgs, coerceList } from "./lib/coerce.ts";
 
 // ────────────────────────────────────────────────────────────────────────────
 // ask_user_question — the tutor asks the learner something that has no right
@@ -76,7 +76,8 @@ export default function askUserQuestion(pi: ExtensionAPI) {
 			"ask_user_question: when you have a suggestion, list it first and add \"(Recommended)\" to its label.",
 		],
 		parameters: Params,
-		prepareArguments: (args: any) => coerceJsonArgs(args, ["options"]),
+		// Options sent as plain strings (["Yes", "No"]) become { label }.
+		prepareArguments: (args: any) => coerceList(coerceJsonArgs(args, ["options"]), "options", "label"),
 
 		async execute(toolCallId, params, signal) {
 			const choices = cleanChoices(params.options);

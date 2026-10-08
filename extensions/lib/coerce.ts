@@ -50,3 +50,20 @@ export function coerceJsonArgs(args: unknown, keys: string[]): any {
 	}
 	return out;
 }
+
+// A list of objects sent as plain strings (["loops"], "loops", or one object
+// instead of a list): wrap each string as { [field]: string } so validation
+// passes instead of the model retrying until it drops the call.
+export function coerceList(args: unknown, key: string, field: string): any {
+	if (!args || typeof args !== "object") return args;
+	const out: Record<string, unknown> = { ...(args as Record<string, unknown>) };
+	let v = out[key];
+	if (typeof v === "string") {
+		const parsed = parseLooseJson(v);
+		v = parsed !== undefined ? parsed : v.trim() ? [v.trim()] : v;
+	}
+	if (v && typeof v === "object" && !Array.isArray(v)) v = [v];
+	if (Array.isArray(v)) v = v.filter((x) => x !== null && x !== undefined && x !== "").map((x) => (typeof x === "string" || typeof x === "number" ? { [field]: String(x).trim() } : x));
+	if (v !== undefined) out[key] = v;
+	return out;
+}

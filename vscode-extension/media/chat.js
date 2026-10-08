@@ -613,6 +613,8 @@
     else if (ask && !ask.done && ask.retry) {
       const left = ask.retry.of - ask.retry.attempt + 1;
       html += `<div class="verdict bad">Not quite: ${answerHtml(ask.retry.previous)}</div>`;
+      // A nudge from reading their answer (never the answer itself).
+      if (ask.retry.hint) html += `<div class="retry-hint">💡 ${answerHtml(ask.retry.hint, "rich")}</div>`;
       html += `<div class="meta-line">Try again: fix your answer below${hintButton(ask) ? ", or take a hint" : ""}. ${left === 1 ? "Last try." : `${left} tries left.`}</div>`;
       html += hintsBlock(ask);
       html += `<textarea class="mono" rows="2" data-typed placeholder="Type your answer…">${esc(ask.draft || "")}</textarea>`;
@@ -621,7 +623,7 @@
       html += hintsBlock(ask);
       html += `<textarea class="mono" rows="2" data-typed placeholder="Type your answer…">${esc(ask.draft || "")}</textarea>`;
       html += `<div class="actions"><button class="btn small" data-act="typed-submit">Submit</button><button class="btn small secondary" data-act="typed-dontknow">I don't know</button>${hintButton(ask)}${keyHint(["Enter submits", "⇧Enter newline", "Esc skips"])}</div>`;
-    } else if (ask) html += yours(ask.draft) + `<div class="pending-line">${SPIN}Grading…</div>`;
+    } else if (ask) html += yours(ask.draft) + `<div class="pending-line">${SPIN}Checking your answer…</div>`;
     else html += preparing(item);
     node.innerHTML = `${html}</div>`;
   }
@@ -823,6 +825,24 @@
     if (ask === item.feedback) vscode.postMessage({ type: "answer", id: ask.id, value: { disputed: false } });
     else vscode.postMessage({ type: "answer", id: ask.id, cancelled: true });
     afterAnswer(item);
+  }
+  // Close every waiting card/question the way its own Skip would. A quiz on
+  // its confidence step keeps the answer (it's sent without a rating).
+  function dismissLive(reason) {
+    for (let guard = 0; guard < 20; guard++) {
+      const it = liveItem();
+      if (!it) break;
+      if (it.kind === "dialog") answerDialog(it, { cancelled: true }, "dismissed");
+      else if (it.ask && !it.ask.done && it.ask.stage === "confidence") confirmConfidence(it, undefined);
+      else {
+        const wasAsk = it.ask && !it.ask.done && !(it.explain && !it.explain.done) && !(it.feedback && !it.feedback.done);
+        skipAsk(it);
+        if (wasAsk && it.skipReason === "Skipped") {
+          it.skipReason = reason;
+          renderItem(it);
+        }
+      }
+    }
   }
   function afterAnswer(item) {
     renderItem(item);
@@ -1249,10 +1269,14 @@
     feed().querySelector(".empty")?.remove();
   }
 
+  // Subjects compare by slug ("Calculus II" vs "calculus-ii").
+  const subjectKey = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+
   function renderExercise() {
     const el = $(".exercise");
     const ex = S.exercise;
-    if (!ex) {
+    // An exercise belongs to its subject: a Java exercise doesn't sit on top of a Calculus chat.
+    if (!ex || (S.subject && ex.subject && subjectKey(S.subject) !== subjectKey(ex.subject))) {
       el.hidden = true;
       return;
     }
@@ -1367,7 +1391,22 @@
         else if (groups.has(c.subject)) groups.get(c.subject).push(c);
         else groups.set(c.subject, [c]);
       }
-      body = [...groups].map(([name, list]) => convGroup(name, list, true)).join("") + (loose.length ? convGroup("No subject", loose, false) : "");
+      // Subject folders ("Fall 2026", "NYU"…): their subjects under a heading, then the rest.
+      const key = (g) => String(g || "").trim().toLowerCase();
+      const folderOf = new Map(data.subjects.map((x) => [x.name, x.group || ""]));
+      const folders = (data.groups || []).filter((g) => [...groups.keys()].some((n) => key(folderOf.get(n)) === key(g)));
+      const section = ([name, list]) => convGroup(name, list, true);
+      body =
+        folders
+          .map(
+            (g) =>
+              `<div class="folder-head">${ICON.folder || "📁"}<span>${esc(g)}</span></div><div class="folder-body">` +
+              [...groups].filter(([n]) => key(folderOf.get(n)) === key(g)).map(section).join("") +
+              "</div>",
+          )
+          .join("") +
+        [...groups].filter(([n]) => !folders.some((g) => key(g) === key(folderOf.get(n)))).map(section).join("") +
+        (loose.length ? convGroup("No subject", loose, false) : "");
       if (!body) body = '<div class="convos-note">No conversations yet.</div>';
     }
     const el = $(".convos");
@@ -1454,7 +1493,12 @@
     }
     const secs = Math.floor((Date.now() - S.runStart) / 1000);
     const tokens = S.runTokens + S.msgTokens;
-    const verb = (!S.hideWorking && S.activity) || S.verb;
+    // A reply that ended on a lead-in ("Here is a variant:") is still working
+    // on the question card; some providers send it only when it's complete,
+    // which can take a while. Say so, so it doesn't look stalled.
+    const lastText = [...S.items].reverse().find((i) => i.kind === "text" || i.kind === "user");
+    const leadIn = lastText && lastText.kind === "text" && /:\s*(\*\*)?\s*$/.test(lastText.text || "");
+    const verb = (!S.hideWorking && S.activity) || (leadIn ? "Writing your question" : S.verb);
     // Update text in place so the CSS spinner keeps animating smoothly.
     if (!el.querySelector(".spinner")) el.innerHTML = `${SPIN}<span class="verb"></span><span class="meta"></span>`;
     el.querySelector(".verb").textContent = `${verb}…`;
@@ -1499,7 +1543,12 @@
       return scrollToBottom(true);
     }
     // Slash commands don't become user messages; echo them like Claude Code.
-    if (text.startsWith("/") && isExtCommand(text)) addItem({ id: nextId("c"), kind: "command", text });
+    const extCmd = text.startsWith("/") && isExtCommand(text);
+    if (extCmd) addItem({ id: nextId("c"), kind: "command", text });
+    // A card waiting blocks the turn, so a chat message would sit unanswered
+    // until it's done: typing to TutorBot instead skips the card (as Esc does).
+    // Commands (/hint, /submit) act on the card, so they leave it open.
+    else dismissLive("Skipped — you sent a message");
     S.stuck = true;
     vscode.postMessage({ type: "send", text });
   }
@@ -2130,6 +2179,7 @@
       case "subject":
         S.subject = m.subject;
         if (S.convos.open) vscode.postMessage({ type: "sessions" });
+        renderExercise();
         return renderFooter();
       case "sessions":
         if (m.error) S.convos.loadError = m.error;

@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { findPlainMath } from "../../extensions/lib/plain-math.ts";
+import { findPlainMath, isMathSubject, repairInputMath, repairMathEscapes } from "../../extensions/lib/plain-math.ts";
 
 const require = createRequire(import.meta.url);
 const PlainMath = require("../media/plainmath.js");
@@ -167,4 +167,49 @@ test("chat webview routes all math through the converter", () => {
   assert.match(chatSrc, /Not quite: \$\{answerHtml\(/);
   // No answer-ish value printed as raw code text.
   assert.doesNotMatch(chatSrc, /<code>\$\{esc\([^)]*(answer|expected|previous|correctAnswer|draft|txt|earlierTries|\bt\b)/i);
+});
+
+// The server-side gate bounces quiz calls with plain-text math. It must not
+// bounce code, arrows or ordinary prose, and must not "repair" code.
+test("plain-math gate: code and prose pass, real plain math is caught", () => {
+  for (const s of [
+    "So $x \\to 0$ → the limit is $1$.",
+    "Find the integral of $x\\cos x$.",
+    "What does a^b print in Java?",
+    "Compute x*y where x=2",
+    "Java: int r = n % 2; r*2",
+    "See https://example.com/a/b?x=1&y=2^3",
+    "Press Ctrl^C to stop.",
+    "Big-O: O(n^2) comparisons",
+    "Use log x to debug",
+    "cos 2 points",
+    "Rate is 5/s",
+    "for (int i = 0; i <= 4; i++) {",
+    "\tSystem.out.println(i * 2);",
+    "Open file_name.txt and data_v2.csv",
+  ]) assert.deepEqual(findPlainMath(s), [], s);
+  for (const s of ["\\frac{1}{2} without dollars", "x_1 + x_2", "3x + 2 = 5", "e^tan(x) * sec^2(x)", "sin x over x", "x² + 1", "dy/dx", "sqrt(x)"])
+    assert.notDeepEqual(findPlainMath(s), [], s);
+});
+
+test("escape repair only rebuilds real LaTeX commands, never code", () => {
+  assert.equal(repairMathEscapes("$e^{\tan x}$"), "$e^{\\tan x}$");
+  assert.equal(repairMathEscapes("$\theta + \frac{1}{2}$"), "$\\theta + \\frac{1}{2}$");
+  assert.equal(repairMathEscapes("Output: $5\t$6"), "Output: $5\t$6"); // a real tab
+  assert.equal(repairMathEscapes("Price is $5 and\tthe $total"), "Price is $5 and\tthe $total");
+  const code = { question: "What prints?", details: 'if (x > 0) {\n\tSystem.out.println("$" + x);\n} else {\n\tSystem.out.println("-$" + (-x));\n}' };
+  const before = code.details;
+  repairInputMath(code);
+  assert.equal(code.details, before);
+  const typed = { question: "What prints?", acceptedAnswers: ["$5\t$6"], verify: { language: "java", code: 'System.out.println("$5\\t$6");' } };
+  repairInputMath(typed);
+  assert.deepEqual(typed.acceptedAnswers, ["$5\t$6"]);
+  const mathQ = { question: "What is $\frac{d}{dx}$ of $\tan x$?" };
+  repairInputMath(mathQ);
+  assert.equal(mathQ.question, "What is $\\frac{d}{dx}$ of $\\tan x$?");
+});
+
+test("isMathSubject", () => {
+  for (const s of ["Calc II", "Linear Algebra", "Statistics", "Physics 1"]) assert.equal(isMathSubject(s), true, s);
+  for (const s of ["Java", "Intro to Python", "CS 101", "Data Structures", "", undefined]) assert.equal(isMathSubject(s), false, String(s));
 });

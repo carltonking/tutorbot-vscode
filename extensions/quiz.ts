@@ -1,9 +1,11 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
+import { type AnswerKind, judgeAnswer, safeHint } from "./lib/answer-judge.ts";
 import { getBridge } from "./lib/bridge.ts";
 import { coerceJsonArgs } from "./lib/coerce.ts";
 import { type MathSpec, mathEquivalent } from "./lib/math-equiv.ts";
-import { describeFailure, labelDescribesFailure, type Language, normalizeOutput, runCode } from "./lib/run-code.ts";
+import { checkComputedKey, statedAnswer } from "./lib/math-key.ts";
+import { describeFailure, labelDescribesFailure, type Language, type RunResult, runCode } from "./lib/run-code.ts";
 
 // ────────────────────────────────────────────────────────────────────────────
 // quiz — graded questions with a known right answer.
@@ -22,6 +24,7 @@ interface QuizOption {
 	label: string;
 	value: string;
 	description?: string;
+	letter?: string; // the "B." the model put before the label (stripped; still accepted as a key)
 }
 
 // One picked choice; `index` is the 1-based number on the card.
@@ -153,7 +156,7 @@ const QuizTypedParams = Type.Object({
 	hints: HintsParam,
 	details: Type.Optional(Type.String({ description: "Optional extra context shown under the question (e.g. the code to trace)." })),
 	explanation: Type.String({
-		description: "REQUIRED. Write this FIRST: work the answer out step by step. Revealed after the learner answers.",
+		description: "REQUIRED. Write this FIRST: work the answer out step by step, ending with a final line `Answer: <the answer>` (required without verify). Revealed after the learner answers.",
 	}),
 	acceptedAnswers: Type.Optional(
 		Type.Array(Type.String(), {
@@ -161,7 +164,7 @@ const QuizTypedParams = Type.Object({
 				"Every acceptable answer form (compared ignoring case and whitespace, e.g. ['2x cos(x^2)', '2xcos(x^2)', 'cos(x^2)*2x']). Optional when verify (mode 'output') is given: then the program's real output is the answer.",
 		}),
 	),
-	caseSensitive: Type.Optional(Type.Boolean({ description: "Default false. Set true when case matters (e.g. exact program output with capitals)." })),
+	caseSensitive: Type.Optional(Type.Boolean({ description: "Default: true when verify (output mode) gives the answer — program output is exact — otherwise false." })),
 	math: Type.Optional(
 		Type.Object(
 			{
@@ -180,19 +183,35 @@ const QuizTypedParams = Type.Object({
 // Wrong typed answers on practice questions: try again before the answer shows.
 const TYPED_ATTEMPTS = 3;
 
+// "A. ", "B) ", "(c) " before a label: the card numbers choices itself and
+// shuffles them, so a kept "D." would show first. Only stripped when every
+// choice has one, in order (A, B, C, …), so a label like "a) is wrong" survives.
+const LETTER_PREFIX = /^\s*(?:\*\*)?(?:\(\s*([A-Ha-h])\s*\)|([A-Ha-h])\s*[.):])(?:\*\*)?\s+(?=\S)/;
+
+// "All of the above" breaks with shuffling and makes two "right" choices.
+const META_OPTION = /^\s*(?:all|none|both|neither)\s+(?:of\s+)?(?:the\s+)?(?:above|these|them|options|answers)\b|^\s*both\s+[A-H]\s+and\s+[A-H]\b/i;
+
 // Trim choices, default each value to its label, drop empty ones. Two choices
-// with the same value can't be graded apart, so that's an error.
+// with the same value or label can't be told apart, so that's an error.
 function cleanOptions(raw: Array<{ label: string; value?: string; description?: string }> | undefined): QuizOption[] {
 	const out: QuizOption[] = [];
 	const values = new Set<string>();
-	for (const o of raw ?? []) {
-		const label = String(o?.label ?? "").trim();
-		if (!label) continue;
+	const labels = new Set<string>();
+	const items = (raw ?? []).map((o) => ({ ...o, label: String(o?.label ?? "").trim() })).filter((o) => o.label);
+	const letters = items.map((o) => o.label.match(LETTER_PREFIX));
+	const lettered = items.length >= 2 && letters.every((m, i) => m && (m[1] ?? m[2]).toLowerCase() === "abcdefgh"[i]);
+	items.forEach((o, i) => {
+		const label = lettered ? o.label.replace(LETTER_PREFIX, "").trim() : o.label;
+		if (META_OPTION.test(label.replace(/[$*_`]/g, "")))
+			throw new Error(`has a "${label}" choice. Choices are shuffled and graded one at a time, so make every choice a concrete answer (use multiSelect when several are right)`);
 		const value = o.value?.trim() || label;
 		if (values.has(value)) throw new Error(`has two choices with the value "${value}"`);
+		const shown = label.replace(/\$/g, "").replace(/\s+/g, " ").trim(); // case counts: "True" ≠ "true"
+		if (labels.has(shown)) throw new Error(`has two choices with the same label "${label}"; make every choice distinct`);
 		values.add(value);
-		out.push({ label, value, description: o.description?.trim() || undefined });
-	}
+		labels.add(shown);
+		out.push({ label, value, description: o.description?.trim() || undefined, letter: lettered ? "ABCDEFGH"[i] : undefined });
+	});
 	return out;
 }
 
@@ -237,6 +256,13 @@ function resolveCorrect(raw: string | string[] | undefined, options: QuizOption[
 		const want = String(k).trim();
 		let i = options.findIndex((o) => o.value === want);
 		if (i < 0) i = options.findIndex((o) => normalizeForMatch(o.value) === normalizeForMatch(want) || normalizeForMatch(o.label) === normalizeForMatch(want));
+		// The model's own letter ("B", "B.", "B. 6") when it prefixed the labels.
+		if (i < 0) {
+			const m = want.match(LETTER_PREFIX) ?? want.match(/^\s*\(?([A-Ha-h])\)?\.?\s*$/);
+			const letter = (m?.[1] ?? m?.[2])?.toUpperCase();
+			const rest = m ? normalizeForMatch(want.replace(LETTER_PREFIX, "")) : "";
+			if (letter) i = options.findIndex((o) => o.letter === letter && (!rest || rest === letter.toLowerCase() || rest === normalizeForMatch(o.label)));
+		}
 		if (i < 0) return { indices: [], error: `correctAnswer "${want}" isn't one of the choices (${options.map((o) => `"${o.value}"`).join(", ")})` };
 		found.add(i + 1);
 	}
@@ -292,7 +318,7 @@ function optionAtStart(claim: string, options: QuizOption[]): number | undefined
 			// sentence, a parenthetical, or "because …". So "2.5" is not "2", and
 			// "start, then hello…, then end" is not "Start".
 			const rest = claim.slice(needle.length).replace(/^["'”’`]+/, "");
-			if (!/^([.!?]?\s*$|\s*[(—–]|\s+-\s|[.!?]?\s+(because|since|as|which)\b)/.test(rest)) continue;
+			if (!/^([.!?]?\s*$|\s*[(—–]|\s+-\s|[.!?]?\s+(because|since|as|which)\b|,?\s+(not|rather than|instead of)\b|,\s*not\b)/.test(rest)) continue;
 			if (!best || needle.length > best.len) best = { idx: i + 1, len: needle.length };
 		}
 	});
@@ -354,25 +380,100 @@ function findContradictedOption(
 // (the question is then withheld and the model must fix it) or undefined.
 type VerifySpec = { language: Language; code: string; mode?: "output" | "assert"; stdin?: string };
 
+// Program output is compared ignoring only whitespace runs: case, quotes and
+// "$" are part of what the program printed ("true" ≠ "True", "$5" ≠ "5").
+function normalizeProgramOutput(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
+// An option label / author key read as program output: a trailing gloss
+// ("1 2 3 (on separate lines)") and wrapping markdown backticks are dropped.
+function normalizeKeyOutput(text: string): string {
+	const t = text.replace(/\s*\((?:on |each |printed |separate|one per)[^)]*\)\s*$/i, "").trim();
+	return normalizeProgramOutput(/^`[^`]*`$/.test(t) ? t.slice(1, -1) : t);
+}
+
+// Does a choice describe how the run failed? Unlike run-code's loose check,
+// a compile error and a runtime exception are different answers, and a named
+// exception ("ArithmeticException") must be the one actually thrown.
+function describesFailure(label: string, r: RunResult): boolean {
+	if (!labelDescribesFailure(label, r)) return false;
+	if (r.timedOut) return true;
+	const compiled = !(r.compileError || /\b(SyntaxError|IndentationError|TabError)\b/.test(r.stderr));
+	const saysCompile = /compil|syntax\s?error|indentation\s?error/i.test(label);
+	if (saysCompile === compiled) return false;
+	const named = label.match(/\b[A-Z][A-Za-z]*(?:Exception|Error)\b/g)?.filter((n) => n !== "Error");
+	return !named?.length || named.some((n) => r.stderr.includes(n));
+}
+
+// An interactive program's prompt ("Enter your age: ") is printed before the
+// input is read, so it is glued to the real output. Returns the first prompt
+// that appears in stdout, if the program reads input.
+const PROMPT_CALLS = [
+	/System\.out\.printf?\s*\(\s*"(?<lit>(?:[^"\\]|\\.)*)"\s*\)/g,
+	/\binput\s*\(\s*(?<q>["'])(?<lit>(?:(?!\k<q>)[^\\]|\\.)*)\k<q>\s*\)/g,
+	/\b(?:question|prompt)\s*\(\s*(?<q>["'`])(?<lit>(?:(?!\k<q>)[^\\]|\\.)*)\k<q>/g,
+	/\bprint\s*\(\s*(?<q>["'])(?<lit>(?:(?!\k<q>)[^\\]|\\.)*)\k<q>\s*,\s*end\s*=\s*(?:""|'')\s*\)/g,
+];
+function printedPrompt(spec: VerifySpec, stdout: string): string | undefined {
+	if (!/\bScanner\b|\binput\s*\(|readLine|BufferedReader|\.question\s*\(|\bprompt\s*\(/.test(spec.code)) return undefined;
+	const lits = PROMPT_CALLS.flatMap((re) => [...spec.code.matchAll(re)].map((m) => m.groups?.lit ?? ""));
+	return lits.find((l) => l.trim() && /[:?>]\s*$|\s$/.test(l) && stdout.includes(l.trim()));
+}
+
+// An assert-mode check must actually check something, and check THIS key.
+function assertProblem(spec: VerifySpec, keys: string[], tool: string): string | undefined {
+	const code = spec.code;
+	if (!/\bassert\b|\braise\b|\bthrow\b|(?:sys|process|System)\.exit\s*\(|\bexit\s*\(\s*[1-9]/.test(code))
+		return `${tool} verify (assert) checks nothing: the program must fail (assert / raise / throw / exit non-zero) when your key is wrong, e.g. \`assert sp.simplify(answer - key) == 0\`. Add the check and call ${tool} again.`;
+	const words = (k: string) => {
+		const t = k.replace(/\\(?:frac|dfrac|left|right|cdot|times|,|!)/g, " ").replace(/\\ln/g, "log").replace(/\\/g, " ");
+		return [...new Set([...(t.match(/\d+(?:\.\d+)?/g) ?? []), ...(t.match(/[A-Za-z]{2,}/g) ?? [])])];
+	};
+	const tokens = keys.flatMap(words);
+	if (!tokens.length || /\b(key|answer|expected|claimed|correct|mine|ours)\w*\b/i.test(code)) return undefined;
+	if (tokens.some((t) => code.includes(t))) return undefined;
+	return `${tool} verify (assert) never mentions your key (${keys.map((k) => `"${k}"`).join(", ")}): it must compute the true answer and assert that it equals the key. Call ${tool} again.`;
+}
+
 async function verifyChoice(spec: VerifySpec, options: QuizOption[], correctIndices: number[]): Promise<string | undefined> {
+	if ((spec.mode ?? "output") === "assert") {
+		const weak = assertProblem(spec, correctIndices.map((i) => options[i - 1].label), "quiz");
+		if (weak) return weak;
+	}
 	const r = await runCode(spec.language, spec.code, spec.stdin);
 	if ((spec.mode ?? "output") === "assert") {
 		return r.ok ? undefined : `quiz verify (assert) failed — your key is wrong or the check is broken. Program ${describeFailure(r)}\nRe-derive the answer, fix correctAnswer/explanation (or the check), and call quiz again.`;
 	}
-	if (correctIndices.length !== 1) return undefined; // output mode compares one answer
-	const key = options[correctIndices[0] - 1];
+	const keys = correctIndices.map((i) => options[i - 1]);
 	if (!r.ok) {
-		if (labelDescribesFailure(key.label, r)) return undefined;
-		const failing = options.findIndex((o) => labelDescribesFailure(o.label, r));
+		const failing = options.map((o, i) => i + 1).filter((i) => describesFailure(options[i - 1].label, r));
+		if (correctIndices.length === 1 && failing.includes(correctIndices[0])) return undefined;
 		return (
 			`quiz verify failed: the code does not run cleanly — ${describeFailure(r)}\n` +
-			(failing >= 0
-				? `So the correct option is "${options[failing].label}", not "${key.label}". Fix correctAnswer and the explanation, then call quiz again.`
-				: "If that is the intended answer, add an option saying so; otherwise fix the code. Then call quiz again.")
+			(failing.length
+				? `So the correct option is "${options[failing[0] - 1].label}", not "${keys.map((k) => k.label).join('", "')}". Fix correctAnswer and the explanation, then call quiz again.`
+				: "If that is the intended answer, add an option that names exactly this failure (a compile error and a runtime exception are different answers); otherwise fix the code. Then call quiz again.")
 		);
 	}
-	const actual = normalizeOutput(r.stdout);
-	const same = (o: QuizOption) => normalizeOutput(o.label) === actual || normalizeOutput(o.value) === actual;
+	const prompt = printedPrompt(spec, r.stdout);
+	if (prompt && !keys.some((k) => k.label.includes(prompt.trim())))
+		return `quiz verify: the program prints an input prompt ("${prompt.trim()}"), so its real output starts with that text. Ask about the output without prompts (drop the prompt from the program and the verify), or make the choices include the prompt exactly as printed. Then call quiz again.`;
+	const actual = normalizeProgramOutput(r.stdout);
+	const same = (o: QuizOption) => normalizeKeyOutput(o.label) === actual || normalizeKeyOutput(o.value) === actual;
+	if (correctIndices.length > 1) {
+		// multiSelect: the right set is exactly the choices that appear as printed lines.
+		const lines = new Set(r.stdout.split("\n").map(normalizeProgramOutput).filter(Boolean));
+		const printed = options.map((o, i) => i + 1).filter((i) => lines.has(normalizeKeyOutput(options[i - 1].label)) || lines.has(normalizeKeyOutput(options[i - 1].value)));
+		if (printed.length === correctIndices.length && printed.every((i) => correctIndices.includes(i))) return undefined;
+		return (
+			`quiz verify failed: the code actually prints:\n${r.stdout.trimEnd() || "(nothing)"}\n` +
+			(printed.length
+				? `The choices that appear in that output are ${printed.map((i) => `"${options[i - 1].label}"`).join(", ")}, not your key ${keys.map((k) => `"${k.label}"`).join(", ")}. Fix correctAnswer and the explanation, then call quiz again.`
+				: "For multiSelect output questions each correct choice must be exactly one printed line. Fix the choices/key and call quiz again.")
+		);
+	}
+	const key = keys[0];
 	if (same(key)) return undefined;
 	const match = options.find(same);
 	if (match) {
@@ -380,7 +481,7 @@ async function verifyChoice(spec: VerifySpec, options: QuizOption[], correctIndi
 	}
 	return (
 		`quiz verify failed: the code actually prints:\n${r.stdout.trimEnd() || "(nothing)"}\n` +
-		`No option's label equals that output. Make the correct option's label exactly the real output (whitespace/newlines are ignored), fix the explanation, and call quiz again.`
+		`No option's label equals that output. Make the correct option's label exactly the real output (whitespace/newlines are ignored; case, quotes and symbols are not), fix the explanation, and call quiz again.`
 	);
 }
 
@@ -463,9 +564,111 @@ function learnerSignalsText(r: QuizResponse, correct: boolean, extras: ChoiceExt
 
 // ── quiz_typed: free-response, graded ───────────────────────────────────────
 
-function normalizeTyped(text: string, caseSensitive: boolean): string {
-	const t = normalizeOutput(text).replace(/\$/g, "");
+// A prose / math answer: lenient. Whitespace, $…$ delimiters, wrapping quotes,
+// a leading "Answer:" and a final period don't count; case only on request.
+function normalizeProse(text: string, caseSensitive: boolean): string {
+	const t = text
+		.trim()
+		.replace(/^\s*(?:final\s+)?answer\s*(?:is\b)?\s*[:=]?\s*/i, "")
+		.replace(/\$+([^$]*)\$+/g, "$1") // $…$ math delimiters; a lone "$5" keeps its sign
+		.replace(/\s+/g, " ")
+		.trim()
+		.replace(/^["'`“‘]+|["'`”’]+$/g, "")
+		.replace(/\.$/, "")
+		.trim();
 	return caseSensitive ? t : t.toLowerCase();
+}
+
+// "12.0" = "12", "1,000" = "1000" (prose answers only; program output is exact).
+function sameNumber(a: string, b: string): boolean {
+	const num = (t: string) => (/^[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)?(?:\.\d+)?$/.test(t) && /\d/.test(t) ? Number(t.replace(/,/g, "")) : NaN);
+	const x = num(a);
+	const y = num(b);
+	return Number.isFinite(x) && Number.isFinite(y) && x === y;
+}
+
+// The explanation's `Answer:` line / an option label as plain text for matching.
+function plainAnswer(text: string): string {
+	return normalizeForMatch(text.replace(LETTER_PREFIX, "").replace(/[*_`$]/g, "").replace(/[.\s]+$/, ""));
+}
+
+const escapeRe = (t: string) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const containsWord = (hay: string, needle: string) => new RegExp(`(?<![\\w.])${escapeRe(needle)}(?![\\w])`, "i").test(hay);
+
+// Values an explanation says the program prints / the answer is ("so the
+// average printed is 15.5", "it prints `30`"). Only plain values (numbers,
+// true/false), which can be compared with the real output.
+export function claimedOutputs(explanation: string): string[] {
+	const out: string[] = [];
+	const re = /\b(?:prints?|printed(?:\s+value)?(?:\s+is)?|outputs?|output\s+is|displays?|(?:final\s+)?answer\s+is|result\s+is)\s*:?\s*[`"']?(-?\d+(?:\.\d+)?|true|false)\b(?![.]\d)/gi;
+	for (const m of explanation.matchAll(re)) out.push(m[1]);
+	return out;
+}
+
+// Without verify, nothing has checked the key, so the explanation must end on
+// it: `Answer: <the key's label>`. An off-by-one key under a vague explanation
+// would otherwise reach the learner unchallenged.
+function answerLineProblem(explanation: string, options: QuizOption[], correctIndices: number[]): string | undefined {
+	if (correctIndices.length !== 1) return undefined;
+	const key = options[correctIndices[0] - 1];
+	const stated = statedAnswer(explanation);
+	if (!stated)
+		return `quiz: the explanation has no final \`Answer: <choice label>\` line and there is no verify, so nothing confirms the key. Re-derive the answer, end the explanation with \`Answer: <exact label of the right choice>\` (or pass verify), and call quiz again.`;
+	const said = plainAnswer(stated);
+	const exact = options.findIndex((o) => plainAnswer(o.label) === said || plainAnswer(o.value) === said);
+	// A longer sentence names the choice it settles on; the longest one wins ("1 2 3" over "1 2").
+	const named = exact >= 0 ? exact : options.reduce((best, o, i) => (plainAnswer(o.label) && containsWord(said, plainAnswer(o.label)) && (best < 0 || o.label.length > options[best].label.length) ? i : best), -1);
+	if (named === correctIndices[0] - 1) return undefined;
+	if (named >= 0)
+		return `quiz self-contradiction: correctAnswer is "${key.value}" but the explanation's Answer line says "${stated}" (choice "${options[named].label}"). Re-derive the answer from the question itself, fix whichever is wrong, and call quiz again.`;
+	// Math in another notation is compared by the computed-key check.
+	if (/[\\^$]/.test(key.label + stated)) return undefined;
+	return `quiz: the explanation's Answer line ("${stated}") isn't any of the choices. End it with \`Answer: <exact label of the right choice>\` and call quiz again.`;
+}
+
+// ── Answer giveaways ─────────────────────────────────────────────────────────
+// Hints, details and the question are shown BEFORE the learner answers.
+const GIVES_AWAY = /\b(?:the\s+)?(?:correct\s+|right\s+|final\s+)?answer\s+(?:is|=|would be|should be)\b|\b(?<!your\s|an\s)answer\s*:\s*\S/i;
+const EXAMPLE = /(?:e\.g\.|for example|for instance|such as|like|format|as in)[,:]?\s*(`[^`\n]+`|\$[^$\n]+\$|[^)\n;]+)/gi;
+
+function giveawayProblem(fields: Array<[string, string | undefined]>, keys: string[], tool: string): string | undefined {
+	for (const [name, text] of fields) {
+		if (!text) continue;
+		const hint = name.startsWith("hint");
+		const plain = text.replace(/```[\s\S]*?```|~~~[\s\S]*?~~~/g, " ").replace(/[$`*_]/g, "");
+		// Program text ("System.out.println(\"Answer: \" + x);") isn't a giveaway.
+		const prose = plain.replace(/^.*[;{}]\s*$/gm, " ").replace(/"[^"\n]*"/g, " ");
+		if (GIVES_AWAY.test(prose)) return `${tool}: the ${name} gives the answer away ("${text.slice(0, 80)}"). Hints, details and the question are shown before the learner answers: never state the answer there. Call ${tool} again.`;
+		for (const k of keys.map(plainAnswer).filter(Boolean)) {
+			// Hints may not contain a computed answer (digits / math) or a long phrase verbatim.
+			const distinctive = /[\d\\^=+*/]/.test(k) || k.length >= 12;
+			// "it's 12", "e.g. 12"; in a hint also "is 12", "= 12" (details may hold code like "x = 12").
+			const lead = hint ? "it'?s|is|equals|gives|get|=|e\\.g\\.|for example|such as" : "it'?s|e\\.g\\.|for example|such as";
+			const stated = new RegExp(`(?:^|[^\\w])(?:${lead})\\s*["'(]*${escapeRe(k)}(?![\\w])`, "i").test(plain);
+			if (stated || (hint && distinctive && containsWord(plain, k)))
+				return `${tool}: the ${name} contains the answer ("${k}"). Hints, details and the question are shown before the learner answers: never include the answer or a worked result there. Call ${tool} again.`;
+		}
+	}
+	return undefined;
+}
+
+// Math the learner sees before answering that already IS the answer ("type it
+// like `-x cos(x) + sin(x) + C`"): example formats in the question/details and
+// any expression in a hint, compared with sympy.
+async function mathGiveaway(fields: Array<[string, string | undefined]>, expected: string, spec: MathSpec, tool: string): Promise<string | undefined> {
+	const spans: Array<[string, string]> = [];
+	for (const [name, text] of fields) {
+		if (!text) continue;
+		for (const m of text.matchAll(EXAMPLE)) spans.push([name, m[1]]);
+		if (name.startsWith("hint")) for (const m of text.matchAll(/`([^`\n]+)`|\$([^$\n]+)\$/g)) spans.push([name, m[1] ?? m[2]]);
+	}
+	for (const [name, span] of spans.slice(0, 6)) {
+		const expr = span.replace(/^[`$]+|[`$.,]+$/g, "").trim();
+		if (!/[A-Za-z0-9]/.test(expr) || expr.length > 120) continue;
+		if ((await mathEquivalent(expr, expected, spec)) === "equal")
+			return `${tool}: the ${name} shows the answer ("${expr}" equals the key). Don't give an example format that is the answer itself — use an unrelated example (e.g. \`3x^2 + C\`) or none. Call ${tool} again.`;
+	}
+	return undefined;
 }
 
 export default function quiz(pi: ExtensionAPI) {
@@ -535,6 +738,16 @@ export default function quiz(pi: ExtensionAPI) {
 				);
 			}
 
+			{
+				const hints = params.purpose === "checkpoint" ? [] : (params.hints ?? []);
+				const shownFirst: Array<[string, string | undefined]> = [["question", params.question], ["details", params.details], ...hints.map((h, i): [string, string] => [`hint ${i + 1}`, h])];
+				const keyError =
+					giveawayProblem(shownFirst, correctIndices.map((i) => options[i - 1].label), "quiz") ??
+					(params.verify ? undefined : answerLineProblem(explanation, options, correctIndices)) ??
+					(await checkComputedKey(params.question, options.map((o) => o.label), correctIndices, explanation, Boolean(params.verify), "quiz"));
+				if (keyError) return unavailableResult(params.question, mode, keyError, correctIndices, context);
+			}
+
 			if (params.verify) {
 				onUpdate?.({ content: [{ type: "text", text: "Verifying answer by running the code..." }] });
 				const verifyError = await verifyChoice(params.verify as VerifySpec, options, correctIndices);
@@ -600,7 +813,7 @@ export default function quiz(pi: ExtensionAPI) {
 		name: "quiz_typed",
 		label: "quiz_typed",
 		description:
-			"Ask a GRADED free-response question: the learner types the answer instead of picking an option, so it can't be found by elimination. Best for code tracing ('type exactly what this prints'), short computations, and recall of a definition/term. Graded by exact match (ignoring whitespace, $ signs and, by default, case) against acceptedAnswers, or against the real program output when verify is given. If the learner disputes a miss as equivalent, you decide.",
+			"Ask a GRADED free-response question: the learner types the answer instead of picking an option, so it can't be found by elimination. Best for code tracing ('type exactly what this prints'), short computations, and recall of a definition/term. Program output (verify) is graded exactly, ignoring only whitespace; other answers ignore case, $ signs and number formatting (12.0 = 12); math answers with `math` are graded by meaning. If the learner disputes a miss as equivalent, you decide.",
 		promptSnippet: "Use quiz_typed for graded free-response questions (code tracing, short computations) where multiple choice would allow guessing.",
 		promptGuidelines: [
 			"quiz_typed: prefer it over quiz for 'what does this code print' once the learner has seen the concept once via multiple choice — typing the full output proves they actually traced it. Always pass verify with the program so the expected answer is the real output.",
@@ -613,8 +826,12 @@ export default function quiz(pi: ExtensionAPI) {
 		prepareArguments: (args: any) => coerceJsonArgs(args, ["concepts", "hints", "acceptedAnswers", "verify", "math"]),
 
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const explanation = params.explanation.trim();
-			const caseSensitive = params.caseSensitive ?? false;
+			let explanation = params.explanation.trim();
+			// Program output (verify in output mode) is graded exactly: case, quotes
+			// and "$" count. Prose and math answers are graded leniently.
+			const outputMode = Boolean(params.verify) && ((params.verify as VerifySpec).mode ?? "output") === "output";
+			const caseSensitive = params.caseSensitive ?? outputMode;
+			const norm = (t: string) => (outputMode ? normalizeProgramOutput(caseSensitive ? t : t.toLowerCase()) : normalizeProse(t, caseSensitive));
 			let accepted = (params.acceptedAnswers ?? []).map((a) => a.trim()).filter(Boolean);
 			const fail = (message: string) => ({
 				content: [{ type: "text" as const, text: message }],
@@ -623,6 +840,10 @@ export default function quiz(pi: ExtensionAPI) {
 
 			if (params.verify) {
 				const spec = params.verify as VerifySpec;
+				if ((spec.mode ?? "output") === "assert" && accepted.length) {
+					const weak = assertProblem(spec, [accepted[0]], "quiz_typed");
+					if (weak) return fail(weak);
+				}
 				onUpdate?.({ content: [{ type: "text", text: "Verifying answer by running the code..." }] });
 				const r = await runCode(spec.language, spec.code, spec.stdin);
 				if ((spec.mode ?? "output") === "assert") {
@@ -630,37 +851,87 @@ export default function quiz(pi: ExtensionAPI) {
 				} else {
 					if (!r.ok) return fail(`quiz_typed verify failed: the code does not run cleanly — ${describeFailure(r)}\nFix the code (or ask about the error with quiz instead).`);
 					const actual = r.stdout.trimEnd();
-					const wrong = accepted.filter((a) => normalizeTyped(a, caseSensitive) !== normalizeTyped(actual, caseSensitive));
+					const prompt = printedPrompt(spec, r.stdout);
+					if (prompt && !accepted.some((a) => a.includes(prompt.trim())))
+						return fail(
+							`quiz_typed verify: the program prints an input prompt ("${prompt.trim()}"), so its real output is:\n${actual}\nThe learner would have to type the prompt too. Ask about the output without prompts (drop the prompt from the program and the verify), or put the full output including the prompt in acceptedAnswers. Then call quiz_typed again.`,
+						);
+					const asOutput = (t: string) => (caseSensitive ? t : t.toLowerCase());
+					const wrong = accepted.filter((a) => normalizeKeyOutput(asOutput(a)) !== normalizeProgramOutput(asOutput(actual)));
 					if (accepted.length && wrong.length === accepted.length) {
 						return fail(
-							`quiz_typed verify failed: the code actually prints:\n${actual || "(nothing)"}\nbut acceptedAnswers says ${JSON.stringify(accepted)}. Re-trace, fix the explanation, and call again (or omit acceptedAnswers to use the real output).`,
+							`quiz_typed verify failed: the code actually prints:\n${actual || "(nothing)"}\nbut acceptedAnswers says ${JSON.stringify(accepted)} (output is compared exactly, ignoring only whitespace). Re-trace, fix the explanation, and call again (or omit acceptedAnswers to use the real output).`,
 						);
 					}
 					accepted = [actual, ...accepted.filter((a) => !wrong.includes(a))];
 				}
 			}
 			if (!accepted.length) return fail("quiz_typed needs acceptedAnswers, or verify in 'output' mode.");
-			if (signal?.aborted) return fail("User cancelled the quiz");
 			const expected = accepted[0];
 			const spec = params.math as MathSpec | undefined;
 			if (spec && (await mathEquivalent(expected, expected, spec)) === "error")
 				return fail(`quiz_typed: math grading couldn't read acceptedAnswers[0] ("${expected}"). Write it as a plain expression (e.g. 3*x/8 + sin(2*x)/4 + C) or simple LaTeX.`);
+			const literalMatch = (answer: string) =>
+				accepted.some((a) => norm(a) === norm(answer) || (!outputMode && sameNumber(norm(a), norm(answer))));
+			{
+				const shownFirst: Array<[string, string | undefined]> = [
+					["question", params.question],
+					["details", params.details],
+					...(params.purpose === "checkpoint" ? [] : (params.hints ?? [])).map((h, i): [string, string] => [`hint ${i + 1}`, h]),
+				];
+				let keyError =
+					giveawayProblem(shownFirst, outputMode ? [] : [expected], "quiz_typed") ??
+					(spec ? await mathGiveaway(shownFirst, expected, spec, "quiz_typed") : undefined) ??
+					(await checkComputedKey(params.question, [expected], [1], explanation, Boolean(params.verify), "quiz_typed"));
+				// Without verify, the explanation must end on the key it was worked out to.
+				if (!keyError && !params.verify) {
+					const stated = statedAnswer(explanation);
+					if (!stated)
+						keyError = "quiz_typed: the explanation has no final `Answer: <the answer>` line and there is no verify, so nothing confirms the key. Re-derive it, end the explanation with `Answer: <acceptedAnswers[0]>` (or pass verify), and call quiz_typed again.";
+					else if (!literalMatch(stated) && (spec ? (await mathEquivalent(stated, expected, spec)) === "different" : !/[\\^$]/.test(stated + expected)))
+						keyError = `quiz_typed: the explanation's Answer line ("${stated}") doesn't match acceptedAnswers[0] ("${expected}"). Re-derive the answer, make the two agree, and call quiz_typed again.`;
+				}
+				// With verify the key is what the program really printed; an explanation
+				// ending "Answer: 15.0" when it printed 30.0 would teach the wrong thing.
+				if (!keyError && params.verify) {
+					const stated = statedAnswer(explanation);
+					// Plain values it claims the program prints, against the real output.
+					const wrongClaim = outputMode && !/\s/.test(expected.trim()) ? claimedOutputs(explanation).find((v) => !literalMatch(v)) : undefined;
+					if (stated && !literalMatch(stated))
+						keyError = `quiz_typed: the explanation ends "Answer: ${stated}", but running the program gives "${expected}". Your explanation's working is wrong somewhere: redo it so it reaches the real output, end with \`Answer: ${expected}\`, and call quiz_typed again.`;
+					else if (wrongClaim !== undefined)
+						keyError = `quiz_typed: the explanation says the program prints / the answer is "${wrongClaim}", but running it prints "${expected}". Your working is wrong somewhere: redo it so it reaches the real output, end with \`Answer: ${expected}\`, and call quiz_typed again.`;
+					// No Answer line: end on the real output, so the learner never reads a different one.
+					else if (!stated) explanation = `${explanation.trimEnd()}\n\nAnswer: ${expected}`;
+				}
+				if (keyError) return fail(keyError);
+			}
+			if (signal?.aborted) return fail("User cancelled the quiz");
 			const grade = async (answer: string) => {
-				const dontKnow = answer.length === 0 || /^(i don'?t know|idk|not sure|\?)$/i.test(answer);
-				let correct = !dontKnow && accepted.some((a) => normalizeTyped(a, caseSensitive) === normalizeTyped(answer, caseSensitive));
-				if (!correct && !dontKnow && spec) correct = (await mathEquivalent(answer, expected, spec)) === "equal";
+				// "?" / "idk" is the learner giving up, unless that IS the expected answer.
+				const literal = accepted.some((a) => norm(a) === norm(answer));
+				const dontKnow = answer.length === 0 || (/^(i don'?t know|idk|not sure|\?)$/i.test(answer) && !literal);
+				const correct = !dontKnow && (literalMatch(answer) || (Boolean(spec) && (await mathEquivalent(answer, expected, spec!)) === "equal"));
 				return { dontKnow, correct };
 			};
 			const hints = params.purpose === "checkpoint" ? [] : (params.hints ?? []).map((h) => h.trim()).filter(Boolean).slice(0, 3);
 			const extras: ChoiceExtras = { checkpoint: params.purpose === "checkpoint", hints };
+			let judgedFrom: string | undefined; // their final answer, pulled out of their working (answer-judge)
+			let judged = false; // a worded answer accepted on meaning
 			const typedResult = (answer: string, dontKnow: boolean, correct: boolean, disputed: boolean, sig: Partial<QuizResponse> = {}, rt: { attempts: number; tries: string[]; revealed: boolean } = { attempts: 1, tries: [], revealed: false }) => {
 				let text: string;
 				if (dontKnow) text = `User said they don't know (no attempt — a genuine gap, not a wrong guess).\nExpected: ${expected}`;
-				else if (correct) text = `User answered correctly${rt.attempts > 1 ? ` on try ${rt.attempts} (earlier tries: ${rt.tries.map((t) => `«${t}»`).join(", ")}) — they found it themselves after a miss; assisted, not yet solid` : ""}.\nTyped: ${answer}`;
+				else if (correct)
+					text =
+						`User answered correctly${rt.attempts > 1 ? ` on try ${rt.attempts} (earlier tries: ${rt.tries.map((t) => `«${t}»`).join(", ")}) — they found it themselves after a miss; assisted, not yet solid` : ""}.\nTyped: ${answer}` +
+						(judgedFrom ? `\n(Their answer included working; their final answer «${judgedFrom}» matches.)` : "") +
+						(judged ? "\n(Worded differently from the key; the answer checker judged it the same idea. If it looks wrong to you, say so.)" : "");
 				else if (disputed)
 					text = `User answered "${answer}", which did not literally match "${expected}", and DISPUTED the grade (they believe it's equivalent). Judge it on substance, call resolve_dispute with your verdict, and tell them which it is and why.`;
 				else text = `User answered incorrectly${rt.attempts > 1 ? ` after ${rt.attempts} tries (${[...rt.tries, ...(rt.revealed ? [] : [answer])].map((t) => `«${t}»`).join(", ")})` : ""}${rt.revealed ? " and pressed Show answer" : ""}.\nTyped: ${answer}\nExpected: ${expected}`;
 				text += learnerSignalsText({ dontKnow, answers: [], ...sig }, correct, extras);
+				// The ground truth, so a follow-up ("but you said 15.5?") is answered from it, not re-guessed.
+				if (outputMode) text += `\nVerified by running the program: it prints «${expected}». That is the fact; if the learner questions the result, explain from it and name exactly which statement of yours was wrong (if one was).`;
 				text += `\nExplanation: ${explanation}`;
 				return {
 					content: [{ type: "text" as const, text }],
@@ -701,6 +972,9 @@ export default function quiz(pi: ExtensionAPI) {
 				let correct = false;
 				let confidence: 1 | 2 | 3 | undefined;
 				let hintsUsed = 0;
+				// A miss gets a second look: the AI reads their working (see answer-judge.ts).
+				const kind: AnswerKind = outputMode ? "output" : spec ? "math" : "text";
+				let retryHint: string | undefined;
 				while (true) {
 					r = await bridge.ask(
 						"typed",
@@ -711,7 +985,7 @@ export default function quiz(pi: ExtensionAPI) {
 							purpose: params.purpose,
 							checkpoint: extras.checkpoint,
 							hints,
-							retry: tries.length ? { previous: tries[tries.length - 1], attempt: tries.length + 1, of: maxTries, hintsShown: hintsUsed } : undefined,
+							retry: tries.length ? { previous: tries[tries.length - 1], attempt: tries.length + 1, of: maxTries, hintsShown: hintsUsed, hint: retryHint } : undefined,
 						},
 						signal,
 					);
@@ -727,6 +1001,23 @@ export default function quiz(pi: ExtensionAPI) {
 					}
 					answer = String(r.dontKnow ? "" : (r.answer ?? "")).trim();
 					({ dontKnow, correct } = await grade(answer));
+					retryHint = undefined;
+					if (!correct && !dontKnow) {
+						const j = await judgeAnswer(ctx, { question: params.question, details: params.details, expected, explanation, answer, kind, earlierTries: tries }, signal);
+						if (j) {
+							// Their final answer, out of the working, still goes through the exact checks.
+							if (j.final && norm(j.final) !== norm(answer) && (await grade(j.final)).correct) {
+								correct = true;
+								judgedFrom = j.final;
+							}
+							// Words: nothing exact to compare, so the reading decides.
+							if (!correct && kind === "text" && j.verdict === "correct" && j.final) {
+								correct = true;
+								judged = true;
+							}
+							if (!correct && !extras.checkpoint) retryHint = safeHint(j.hint, accepted);
+						}
+					}
 					if (correct || dontKnow || tries.length + 1 >= maxTries) break;
 					tries.push(answer);
 				}

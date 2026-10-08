@@ -261,6 +261,7 @@ code { font-family: var(--tb-mono); font-size: 0.92em; }
 .verdict { margin-top: 8px; font-weight: 600; }
 .verdict.good { color: var(--tb-fg); }
 .verdict.bad { color: var(--tb-fg); }
+.retry-hint { margin-top: 4px; padding: 6px 8px; border-left: 2px solid var(--tb-border); color: var(--tb-fg); }
 .verdict.warn { color: var(--tb-muted); }
 .explain { margin-top: 6px; padding-top: 8px; border-top: 1px dashed var(--tb-border); }
 .explain > :first-child { margin-top: 0; }
@@ -376,6 +377,9 @@ body.vscode-high-contrast .card.live, body.vscode-high-contrast-light .card.live
 .convos-note { padding: 16px 8px; color: var(--tb-muted); font-size: 12px; display: flex; align-items: center; }
 .grp { margin-top: 8px; }
 .grp + .grp { border-top: 1px solid var(--tb-border); padding-top: 8px; }
+.folder-head { display: flex; align-items: center; gap: 6px; padding: 10px 6px 2px; color: var(--tb-muted); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.folder-head svg { width: 14px; height: 14px; }
+.folder-body { padding-left: 10px; border-left: 1px solid var(--tb-border); margin-left: 12px; }
 .grp-head { display: flex; align-items: center; gap: 6px; min-height: 24px; padding: 0 6px; }
 .grp-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .grp-head .tag, .conv .c-meta { color: var(--tb-muted); font-size: 11px; white-space: nowrap; }

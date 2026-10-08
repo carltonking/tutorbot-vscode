@@ -93,6 +93,8 @@ export interface QuizRecord {
 	confidence?: Confidence;
 	hintsUsed?: number;
 	attempts?: number; // typed answers: tries before it was right (or the answer was shown)
+	toolCallId?: string; // the quiz call it came from (disputes are settled per record)
+	wasDisputed?: boolean; // settled by resolve_dispute: never proof for a checkpoint
 	selfExplanation?: string; // explain-it-back text
 	explainQuality?: "good" | "partial" | "missing";
 	approach?: Approach; // approach the concept was taught with
@@ -109,7 +111,7 @@ export interface LessonFeedback {
 export interface Signal {
 	ts: string;
 	subject?: string;
-	kind: "frustration" | "asked-for-answer" | "stuck" | "escape-hatch";
+	kind: "frustration" | "asked-for-answer" | "stuck" | "escape-hatch" | "solution-leak" | "lesson-construct";
 	detail?: string;
 }
 
@@ -164,6 +166,28 @@ export function slug(text: string): string {
 export function conceptId(subject: string, name: string): string {
 	return `${slug(subject)}/${slug(name)}`;
 }
+
+// A concept name's identity for the gates: case, spacing, plurals, a
+// "-basics"-style suffix and an "in Java" tail don't matter ("String basics" =
+// "strings"), but extra words do ("nested loops" ≠ "loops").
+const KEY_STOP = new Set(["the", "a", "an"]);
+const singular = (w: string): string =>
+	w.length > 4 && w.endsWith("ies") ? `${w.slice(0, -3)}y` : w.length > 4 && /(ss|ch|sh|x)es$/.test(w) ? w.slice(0, -2) : w.length > 3 && /[^s]s$/.test(w) ? w.slice(0, -1) : w;
+export function conceptKey(name: string): string {
+	const s = slug(name)
+		.replace(/-(in|for|with|using)-(java|python|javascript|js)$/, "")
+		.replace(/-(basics|fundamentals|intro|introduction|overview)$/, "")
+		.replace(/^(intro-to|introduction-to|basics-of)-/, "");
+	return s
+		.split("-")
+		.filter((w) => w && !KEY_STOP.has(w))
+		.map(singular)
+		.join("-");
+}
+export const sameConcept = (a: string, b: string): boolean => conceptKey(a) === conceptKey(b);
+
+// Correct with no help: not a guess, no hints, first try.
+export const unaidedCorrect = (r: QuizRecord): boolean => r.outcome === "correct" && r.confidence !== 1 && !((r.hintsUsed ?? 0) > 0) && !((r.attempts ?? 0) > 1);
 
 const pct = (a: number, b: number) => (b ? Math.round((100 * a) / b) : 0);
 
@@ -281,10 +305,11 @@ export class TutorStore {
 	// How strong the evidence is that they really know it.
 	proofLevel(data: ProgressData, c: Concept): ProofLevel {
 		if (c.verified) return "proven";
-		const graded = this.answersFor(data, c).filter((r) => GRADED.includes(r.purpose) && r.outcome !== "disputed");
+		// An unsettled dispute counts as a (provisional) miss.
+		const graded = this.answersFor(data, c).filter((r) => GRADED.includes(r.purpose));
 		if (!graded.length) return c.status === "known" ? "on-your-own" : "not-tested";
 		const correct = graded.filter((r) => r.outcome === "correct");
-		if (correct.some((r) => !(r.hintsUsed ?? 0) && r.confidence !== 1)) return "on-your-own";
+		if (correct.some(unaidedCorrect)) return "on-your-own";
 		if (correct.length) return "with-help";
 		return "not-yet";
 	}
@@ -349,6 +374,8 @@ export class TutorStore {
 	findConcept(data: ProgressData, subject: string, name: string): Concept | undefined {
 		const id = conceptId(subject, name);
 		if (data.concepts[id]) return data.concepts[id];
+		const strict = this.findConceptStrict(data, subject, name);
+		if (strict) return strict;
 		const s = slug(name);
 		if (s.length < 4) return undefined;
 		const subj = slug(subject);
@@ -363,6 +390,17 @@ export class TutorStore {
 			if (gap < bestGap) [best, bestGap] = [c, gap];
 		}
 		return best;
+	}
+
+	// The gates' lookup: the same concept by conceptKey only, never a looser
+	// containment match ("while loops" is not "loops").
+	findConceptStrict(data: ProgressData, subject: string, name: string): Concept | undefined {
+		const id = conceptId(subject, name);
+		if (data.concepts[id]) return data.concepts[id];
+		const key = conceptKey(name);
+		if (!key) return undefined;
+		const subj = slug(subject);
+		return Object.values(data.concepts).find((c) => slug(c.subject) === subj && conceptKey(c.name) === key);
 	}
 
 	// Every logged answer resolved to its concept(s) once, then cached until the
@@ -408,15 +446,16 @@ export class TutorStore {
 		let moved = 0;
 		const concepts: Record<string, Concept> = {};
 		const newIds: Record<string, string> = {};
-		for (const [id, c] of Object.entries(data.concepts)) {
-			if (slug(c.subject) !== f) {
-				concepts[id] = c;
-				continue;
-			}
+		const entries = Object.entries(data.concepts);
+		for (const [id, c] of entries) if (slug(c.subject) !== f) concepts[id] = c;
+		for (const [id, c] of entries) {
+			if (slug(c.subject) !== f) continue;
 			c.subject = to;
 			c.id = conceptId(to, c.name);
 			newIds[id] = c.id;
-			concepts[c.id] = c;
+			// Merging into a subject that already has this concept: keep the
+			// stronger record and add up the evidence, never overwrite it.
+			concepts[c.id] = concepts[c.id] ? mergeConcepts(concepts[c.id], c) : c;
 			moved++;
 		}
 		data.concepts = concepts;
@@ -473,7 +512,9 @@ export class TutorStore {
 		const now = new Date().toISOString();
 		const out: Concept[] = [];
 		for (const item of items) {
-			const existing = this.findConcept(data, subject, item.name);
+			// A new name is a new concept (it needs its own lesson), not an update
+			// of a loosely similar one.
+			const existing = this.findConceptStrict(data, subject, item.name);
 			const c: Concept = existing ?? {
 				id: conceptId(subject, item.name),
 				subject,
@@ -498,6 +539,9 @@ export class TutorStore {
 
 	recordQuiz(record: QuizRecord): void {
 		const data = this.loadProgress();
+		// A future (or garbled) timestamp would sort ahead of every real answer.
+		const t = Date.parse(record.ts);
+		if (!Number.isFinite(t) || t > Date.now()) record.ts = new Date().toISOString();
 		if (!record.approach) {
 			for (const n of record.concepts) {
 				const a = this.findConcept(data, record.subject, n)?.approach;
@@ -522,12 +566,24 @@ export class TutorStore {
 		return rec;
 	}
 
-	// Settle the most recent disputed typed answer (the learner pressed "d").
-	resolveDispute(verdict: "correct" | "incorrect"): QuizRecord | undefined {
+	// Settle a disputed typed answer (the learner pressed "d"): the one from that
+	// quiz call when known, else the latest one in this subject from the last
+	// day. An old dispute in another subject is never flipped.
+	resolveDispute(verdict: "correct" | "incorrect", opts: { subject?: string; toolCallId?: string } = {}): QuizRecord | undefined {
 		const data = this.loadProgress();
-		const rec = [...data.quizLog].reverse().find((r) => r.outcome === "disputed");
+		const since = Date.now() - 86_400_000;
+		const rec = [...data.quizLog]
+			.reverse()
+			.find(
+				(r) =>
+					r.outcome === "disputed" &&
+					(opts.toolCallId ? r.toolCallId === opts.toolCallId : true) &&
+					(!opts.subject || slug(r.subject) === slug(opts.subject)) &&
+					Date.parse(r.ts) >= since,
+			);
 		if (!rec) return undefined;
 		rec.outcome = verdict;
+		rec.wasDisputed = true;
 		this.applySchedule(data, rec);
 		this.saveProgress(data);
 		return rec;
@@ -539,9 +595,11 @@ export class TutorStore {
 			let c = this.findConcept(data, record.subject, name);
 			if (record.purpose === "discovery") continue; // mid-discovery attempt: logged only
 			if (record.purpose === "diagnostic") {
-				// Pre-teaching probe: a correct, confident answer means they already
-				// hold it. A miss is just a mapped gap.
-				if (record.outcome === "correct" && !c && record.confidence !== 1) {
+				// Pre-teaching probe. "Known" needs proof, not one lucky answer: two
+				// confident, unaided, single-concept diagnostics on it (one typed).
+				// A miss is just a mapped gap.
+				c = this.findConceptStrict(data, record.subject, name);
+				if (!c && this.provenByDiagnostics(data, record.subject, name)) {
 					c = {
 						id: conceptId(record.subject, name),
 						subject: record.subject,
@@ -567,13 +625,18 @@ export class TutorStore {
 				continue;
 			}
 			if (!c) continue;
-			if (record.outcome === "disputed") continue; // adjudicated later
+			if (record.outcome === "disputed") {
+				// Adjudicated later; until then a provisional miss, so re-check soon.
+				c.due = new Date(Math.min(Date.now(), Date.parse(record.ts))).toISOString();
+				continue;
+			}
 			c.attempts++;
 			c.lastSeen = record.ts;
 			const checkpoint = record.purpose === "checkpoint";
 			if (record.outcome === "correct") {
 				c.correct++;
-				const assisted = !checkpoint && ((record.hintsUsed ?? 0) > 0 || record.confidence === 1);
+				// Right on a retry is found after seeing a miss: assisted too.
+				const assisted = !checkpoint && ((record.hintsUsed ?? 0) > 0 || record.confidence === 1 || (record.attempts ?? 0) > 1);
 				if (assisted) {
 					// Practice success that needed help doesn't move the schedule on.
 					c.assisted = (c.assisted ?? 0) + 1;
@@ -582,7 +645,8 @@ export class TutorStore {
 					c.box = Math.min(BOX_INTERVAL_DAYS.length - 1, c.box + 1);
 					c.due = addDays(now, BOX_INTERVAL_DAYS[c.box]);
 				}
-				if (checkpoint) c.verified = true;
+				// A guess or a settled dispute is not checkpoint proof.
+				if (checkpoint && unaidedCorrect(record) && !record.wasDisputed) c.verified = true;
 			} else {
 				c.box = 0;
 				c.due = now.toISOString();
@@ -599,6 +663,22 @@ export class TutorStore {
 			}
 			c.status = c.verified && (c.fsrs?.stability ?? 0) >= MASTERED_STABILITY_DAYS ? "mastered" : "learning";
 		}
+	}
+
+	// Two confident, unaided diagnostics tagged with only this concept, at least
+	// one typed (typing the answer can't be done by elimination).
+	provenByDiagnostics(data: ProgressData, subject: string, name: string): boolean {
+		const key = conceptKey(name);
+		const proofs = data.quizLog.filter(
+			(r) =>
+				r.purpose === "diagnostic" &&
+				slug(r.subject) === slug(subject) &&
+				r.concepts.length === 1 &&
+				conceptKey(r.concepts[0]) === key &&
+				(r.confidence === 2 || r.confidence === 3) &&
+				unaidedCorrect(r),
+		);
+		return proofs.length >= 2 && proofs.some((r) => r.kind === "typed");
 	}
 
 	addLessonFeedback(fb: Omit<LessonFeedback, "ts" | "approach"> & { approach?: Approach }): LessonFeedback {
@@ -1076,6 +1156,25 @@ function scoreApproach(a: ApproachStat): number {
 	const rt = (a.retentionPct * a.retentionN + 50 * prior) / (a.retentionN + prior);
 	const ratings = (a.clicked - a.fuzzy) * 4;
 	return fc * 0.5 + rt * 0.5 + ratings;
+}
+
+// Two records of one concept (a subject rename onto an existing subject):
+// the stronger one wins, the counts add up.
+function mergeConcepts(a: Concept, b: Concept): Concept {
+	const strength = (c: Concept) => (c.verified ? 1000 : 0) + c.box * 10 + c.correct;
+	const [win, lose] = strength(b) > strength(a) ? [b, a] : [a, b];
+	const earliest = (x?: string, y?: string) => (!x ? y : !y ? x : x < y ? x : y);
+	const latest = (x?: string, y?: string) => (!x ? y : !y ? x : x > y ? x : y);
+	return {
+		...lose,
+		...win,
+		attempts: a.attempts + b.attempts,
+		correct: a.correct + b.correct,
+		assisted: (a.assisted ?? 0) + (b.assisted ?? 0) || undefined,
+		confidentMisses: (a.confidentMisses ?? 0) + (b.confidentMisses ?? 0) || undefined,
+		taughtAt: earliest(a.taughtAt, b.taughtAt),
+		lastSeen: latest(a.lastSeen, b.lastSeen),
+	};
 }
 
 function addDays(d: Date, days: number): string {

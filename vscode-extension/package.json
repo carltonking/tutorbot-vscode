@@ -8,7 +8,7 @@
     "url": "https://github.com/carltonking/tutorbot-vscode.git",
     "directory": "vscode-extension"
   },
-  "version": "0.12.8",
+  "version": "0.12.15",
   "publisher": "CarltonKing",
   "license": "MIT",
   "engines": {
@@ -155,12 +155,41 @@
         "title": "Refresh Subjects",
         "category": "TutorBot",
         "icon": "$(refresh)"
+      },
+      {
+        "command": "tutorbot.newSubjectGroup",
+        "title": "New Subject Folder",
+        "category": "TutorBot",
+        "icon": "$(new-folder)"
+      },
+      {
+        "command": "tutorbot.moveSubjectToGroup",
+        "title": "Move to Subject Folder…",
+        "category": "TutorBot",
+        "icon": "$(folder-library)"
+      },
+      {
+        "command": "tutorbot.renameSubjectGroup",
+        "title": "Rename Subject Folder",
+        "category": "TutorBot",
+        "icon": "$(edit)"
+      },
+      {
+        "command": "tutorbot.deleteSubjectGroup",
+        "title": "Delete Subject Folder",
+        "category": "TutorBot",
+        "icon": "$(trash)"
       }
     ],
     "menus": {
       "view/title": [
         {
           "command": "tutorbot.newSubject",
+          "when": "view == tutorbot.directory",
+          "group": "navigation@1"
+        },
+        {
+          "command": "tutorbot.newSubjectGroup",
           "when": "view == tutorbot.directory",
           "group": "navigation@1"
         },
@@ -338,6 +367,31 @@
           "command": "tutorbot.removeSubjectFolder",
           "when": "view == tutorbot.directory && viewItem == folder",
           "group": "1_edit@1"
+        },
+        {
+          "command": "tutorbot.moveSubjectToGroup",
+          "when": "view == tutorbot.directory && viewItem == subject",
+          "group": "2_organize@1"
+        },
+        {
+          "command": "tutorbot.renameSubjectGroup",
+          "when": "view == tutorbot.directory && viewItem == subjectGroup",
+          "group": "inline@1"
+        },
+        {
+          "command": "tutorbot.deleteSubjectGroup",
+          "when": "view == tutorbot.directory && viewItem == subjectGroup",
+          "group": "inline@2"
+        },
+        {
+          "command": "tutorbot.renameSubjectGroup",
+          "when": "view == tutorbot.directory && viewItem == subjectGroup",
+          "group": "1_edit@1"
+        },
+        {
+          "command": "tutorbot.deleteSubjectGroup",
+          "when": "view == tutorbot.directory && viewItem == subjectGroup",
+          "group": "1_edit@2"
         }
       ]
     },
