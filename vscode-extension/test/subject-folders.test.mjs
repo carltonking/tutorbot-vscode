@@ -64,3 +64,14 @@ test("a subject keeps its folder through a rename, and the file stays readable",
   assert.deepEqual(raw.groups, ["NYU"]);
   assert.throws(() => r.createGroup("   "), /at least one character/);
 });
+
+test("removing a class folder from one subject leaves other subjects using it", () => {
+  const { r } = fresh();
+  r.addFolder("Java", "/classes/shared");
+  r.addFolder("Cosmology", "/classes/shared");
+  r.removeFolder("/classes/shared", "java");
+  assert.deepEqual(r.find("Java").folders, []);
+  assert.deepEqual(r.find("Cosmology").folders, ["/classes/shared"]);
+  r.removeFolder("/classes/shared"); // no subject: every subject stops using it
+  assert.deepEqual(r.find("Cosmology").folders, []);
+});

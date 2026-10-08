@@ -815,7 +815,7 @@ export default function tutor(pi: ExtensionAPI) {
 			const subject = (typeof body?.subject === "string" && body.subject) || activeSubject;
 			try {
 				if (body?.action === "remove" && body?.path) {
-					get(ctx).registry.removeFolder(String(body.path));
+					get(ctx).registry.removeFolder(String(body.path), subject);
 					showSubjectStatus(ctx);
 					return { ok: true };
 				}
@@ -1925,7 +1925,7 @@ ${resources}
 				const p = expandPath(target);
 				config.resourceFolders = config.resourceFolders.filter((f) => f !== p && !f.endsWith(target));
 				store.saveConfig(config);
-				registry.removeFolder(p);
+				registry.removeFolder(p, activeSubject);
 				ctx.ui.notify("Removed.", "info");
 				return;
 			}
@@ -1979,7 +1979,7 @@ ${resources}
 				return;
 			}
 			if (a.startsWith("remove ")) {
-				registry.removeFolder(expandPath(a.slice(7)));
+				registry.removeFolder(expandPath(a.slice(7)), activeSubject);
 				showSubjectStatus(ctx);
 				ctx.ui.notify("Removed.", "info");
 				return;

@@ -983,7 +983,7 @@ class Controller {
     if (pick !== "Remove Folder") return;
     try {
       await this.ready();
-      const r = await this.bridge.post("setFolder", { action: "remove", path: folder });
+      const r = await this.bridge.post("setFolder", { action: "remove", subject: name, path: folder });
       if (!r.ok) throw new Error(r.error || "Couldn't remove that folder.");
     } catch (e) {
       vscode.window.showErrorMessage(e.message);
@@ -1029,6 +1029,20 @@ class Controller {
     if (!this.subject) {
       this.post({ type: "notice", level: "warning", text: "Pick a subject first (Home), then choose its class folder." });
       return;
+    }
+    // With folders already set, let the learner add another or remove one.
+    const current = this.folders || [];
+    if (current.length) {
+      const pick = await vscode.window.showQuickPick(
+        [
+          { label: "$(new-folder) Add another class folder…" },
+          { label: "Remove", kind: vscode.QuickPickItemKind.Separator },
+          ...current.map((f) => ({ label: `$(trash) ${f.name}`, description: f.path, folder: f })),
+        ],
+        { title: `${this.subject} class folders`, placeHolder: "Add a folder, or pick one to stop using it" }
+      );
+      if (!pick) return;
+      if (pick.folder) return this.removeSubjectFolder(this.subject, pick.folder.path);
     }
     const path = await this.showFolderDialog(`Choose the folder with your ${this.subject} class materials`);
     if (!path) return;

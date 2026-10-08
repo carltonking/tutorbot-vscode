@@ -1231,7 +1231,7 @@
           <textarea rows="1" placeholder="Ask TutorBot…  (/ for commands)" aria-label="Message TutorBot"></textarea>
           <div class="bar">
             <button class="chip" data-act="subject" title="Switch subject (/home)">${ICON.book}<span class="subj">No subject</span></button>
-            <button class="chip" data-act="folder" title="Class folder for this subject: TutorBot learns your teacher's question style from it" hidden>${ICON.folder}<span class="fld">Add class folder</span></button>
+            <button class="chip" data-act="folder" title="Class folders for this subject (click to add or remove): TutorBot learns your teacher's question style from them" hidden>${ICON.folder}<span class="fld">Add class folder</span></button>
             <button class="chip" data-act="model" title="Change model"><span class="mdl"></span><span class="caret">▾</span></button>
             <div class="spacer"></div>
             <button class="send" data-act="send" title="Send (Enter)" aria-label="Send" disabled>${ICON.send}</button>

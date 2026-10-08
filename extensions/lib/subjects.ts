@@ -134,9 +134,11 @@ export class SubjectRegistry {
 		if (!s.folders.includes(folder)) this.update(name, { folders: [...s.folders, folder] });
 	}
 
-	removeFolder(folder: string): void {
+	// Stop using a folder for one subject, or for every subject when none is given.
+	removeFolder(folder: string, subject?: string): void {
 		const r = this.load();
-		for (const s of Object.values(r.subjects)) s.folders = s.folders.filter((f) => f !== folder && !f.endsWith(folder));
+		const targets = subject ? [r.subjects[this.canonicalKey(r, slug(subject))]].filter(Boolean) : Object.values(r.subjects);
+		for (const s of targets) s.folders = s.folders.filter((f) => f !== folder && !f.endsWith(folder));
 		this.save(r);
 	}
 
